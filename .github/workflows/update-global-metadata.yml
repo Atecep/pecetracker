@@ -75,7 +75,7 @@ jobs:
             echo "HLTB_LIMIT=${{ inputs.hltb_limit }}" >> "$GITHUB_ENV"
           else
             echo "STEAM_LIMIT=2500" >> "$GITHUB_ENV"
-            echo "HLTB_LIMIT=1000" >> "$GITHUB_ENV"
+            echo "HLTB_LIMIT=1200" >> "$GITHUB_ENV"
           fi
 
       - name: Update global metadata
@@ -83,7 +83,7 @@ jobs:
           python global_metadata/build_global_database.py \
             --steam-limit "$STEAM_LIMIT" \
             --hltb-limit "$HLTB_LIMIT" \
-            --hltb-pause 1.5
+            --hltb-pause 1.7
 
       - name: Checkpoint and verify SQLite database
         run: |
