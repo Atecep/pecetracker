@@ -3,12 +3,20 @@ name: Update Global Metadata
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Production update or isolated HLTB validation (up to 50 games)"
+        type: choice
+        required: true
+        default: production
+        options:
+          - production
+          - hltb_validation
       steam_limit:
-        description: "Steam games to process in this run"
+        description: "Steam games to process in production mode only"
         required: true
         default: "100"
       hltb_limit:
-        description: "HLTB games to process in this run"
+        description: "HLTB games to process in production mode only"
         required: true
         default: "100"
 
@@ -17,7 +25,7 @@ on:
     - cron: "12 0,2,4,6,8,10,12,14,16,18,20,22 * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: global-metadata-update
@@ -25,8 +33,11 @@ concurrency:
 
 jobs:
   update-global-metadata:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'production') }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    permissions:
+      contents: write
 
     env:
       GH_TOKEN: ${{ github.token }}
@@ -744,4 +755,134 @@ jobs:
             global_metadata/data/global_metadata.db.zst
             global_metadata/data/global_metadata.db.zst.sha256
           if-no-files-found: error
+          retention-days: 7
+
+  validate-hltb:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'hltb_validation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VALIDATION_DIR: ${{ runner.temp }}/hltb-validation
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: global_metadata/requirements.txt
+
+      - name: Install global metadata dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r global_metadata/requirements.txt
+
+      - name: Prepare isolated validation directory
+        run: mkdir -p "$VALIDATION_DIR/source"
+
+      - name: Download and verify source snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            gh release download global-db \
+              --pattern "global_metadata.db" \
+              --dir "$VALIDATION_DIR/source"
+            gh release download global-db \
+              --pattern "global_metadata.db.sha256" \
+              --dir "$VALIDATION_DIR/source"
+            cd "$VALIDATION_DIR/source"
+            sha256sum -c global_metadata.db.sha256
+          } 2>&1 | tee "$VALIDATION_DIR/source-verification.log"
+
+      - name: Create test SQLite from read-only snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' 2>&1 | tee "$VALIDATION_DIR/sqlite-copy.log"
+          from contextlib import closing
+          import os
+          from pathlib import Path
+          import sqlite3
+
+          directory = Path(os.environ["VALIDATION_DIR"])
+          source = directory / "source" / "global_metadata.db"
+          target = directory / "hltb-validation.db"
+          with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src:
+              with closing(sqlite3.connect(target)) as dst:
+                  src.backup(dst)
+          print("Created isolated test SQLite; existing updater state preserved.")
+          PY
+
+      - name: Run HLTB diagnostic batch (no Steam requests)
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u global_metadata/build_global_database.py \
+            --db "$VALIDATION_DIR/hltb-validation.db" \
+            --skip-catalog \
+            --steam-limit 0 \
+            --hltb-limit 50 \
+            --hltb-pause 1 \
+            2>&1 | tee "$VALIDATION_DIR/diagnostics.log"
+
+      - name: Checkpoint test SQLite and record suspension state
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' 2>&1 | tee "$VALIDATION_DIR/sqlite-check.log"
+          from contextlib import closing
+          import os
+          from pathlib import Path
+          import sqlite3
+
+          db = Path(os.environ["VALIDATION_DIR"]) / "hltb-validation.db"
+          if not db.exists():
+              print("No test SQLite was created.")
+              raise SystemExit(0)
+
+          with closing(sqlite3.connect(db, timeout=30)) as conn:
+              checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+              result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+              state = conn.execute(
+                  "SELECT value FROM updater_state WHERE key = ?",
+                  ("hltb_service_retry_after",),
+              ).fetchone()
+          print(f"WAL checkpoint: {checkpoint}")
+          print(f"SQLite integrity check: {result}")
+          print(f"HLTB service retry after: {state[0] if state else 'not set'}")
+          if checkpoint[0] != 0 or result != "ok":
+              raise SystemExit("SQLite verification failed; retain database and WAL artifacts.")
+          PY
+
+      - name: Save HLTB diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hltb-validation-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_DIR }}/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save test SQLite including suspension state
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hltb-validation-sqlite-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.VALIDATION_DIR }}/hltb-validation.db
+            ${{ env.VALIDATION_DIR }}/hltb-validation.db-wal
+            ${{ env.VALIDATION_DIR }}/hltb-validation.db-shm
+          if-no-files-found: warn
           retention-days: 7
