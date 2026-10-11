@@ -6,9 +6,11 @@ import importlib
 import io
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import tempfile
+import textwrap
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 import unittest
@@ -392,12 +394,15 @@ class TransportTests(OfflineTest):
 
 
 class AuthenticationTests(OfflineTest):
-    def compare_original_and_instrumented(self, auth, redirects=False):
+    def compare_original_and_instrumented(self, auth, redirects=False, endpoint="/api/search/site"):
         module = importlib.import_module("howlongtobeatpy.HTMLRequests")
         from howlongtobeatpy import HowLongToBeat
         calls = []
         for instrumented in (False, True):
-            failures = {"authentication": [response(body=auth)]}
+            failures = {
+                "authentication": [response(body=auth)],
+                "script": [response(body=f'fetch("{endpoint}", {{method: "POST"}})')],
+            }
             if redirects:
                 redirected = response(302, "", {
                     "Location": "/api/search/site/init?redirected=1",
@@ -555,6 +560,210 @@ class AuthenticationTests(OfflineTest):
         self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
         self.assertIsNone(builder.search_hltb_global("Portal", transport=transport, protection=protection))
         self.assertEqual(protection.failures, 0)
+
+    def test_exact_json_fields_are_separate_from_parsed_fields(self):
+        for key_name, value_name in (("key", "value"), ("hpKey", "hpVal")):
+            with self.subTest(key_name=key_name):
+                transport = self.compare_original_and_instrumented({
+                    "token": "SECRET_TOKEN", key_name: "SECRET_KEY", value_name: "SECRET_VALUE",
+                })
+                diagnostics = transport.records[-2]["authentication_diagnostics"]
+                self.assertEqual(diagnostics["json_fields"][key_name], {"present": True, "type": "str"})
+                self.assertEqual(diagnostics["json_fields"][value_name], {"present": True, "type": "str"})
+                other_key = "hpKey" if key_name == "key" else "key"
+                self.assertEqual(diagnostics["json_fields"][other_key], {"present": False, "type": None})
+                self.assertTrue(diagnostics["fields"]["key"]["available"])
+                self.assertEqual(diagnostics["parser_candidates"]["key"], {"count": 1, "types": ["str"], "selected_type": "str"})
+
+    def test_absent_and_null_auth_fields_have_different_diagnostics(self):
+        for auth, present in (({"token": "SECRET_TOKEN"}, False),
+                              ({"token": "SECRET_TOKEN", "hpKey": None, "hpVal": None}, True)):
+            with self.subTest(present=present):
+                fake = FakeHTTP({"authentication": [response(body=auth)]})
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=fake.send):
+                    transport = HLTBTransport(emit=self.output.write)
+                    with self.assertRaises(HLTBFailure) as caught:
+                        transport.search("Portal", "original", 1)
+                self.assertEqual(caught.exception.kind, "missing_fields")
+                shape = caught.exception.diagnostics
+                self.assertEqual(shape["json_fields"]["hpKey"], {"present": present, "type": "NoneType" if present else None})
+                self.assertEqual(shape["json_fields"]["hpVal"], {"present": present, "type": "NoneType" if present else None})
+                self.assertEqual(shape["parser_candidates"]["key"]["count"], int(present))
+                self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_invalid_json_and_root_types_fail_in_both_clients(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        for auth, original_error, kind in (("SECRET_INVALID_JSON", ValueError, "invalid_json"),
+                                           ([], AttributeError, "unexpected_type"),
+                                           (None, AttributeError, "unexpected_type")):
+            with self.subTest(kind=kind):
+                original_fake = FakeHTTP({"authentication": [response(body=auth)]})
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=original_fake.send):
+                    with self.assertRaises(original_error):
+                        module.HTMLRequests.send_website_get_auth_token("api/search/site", "fixture-agent")
+                adapted_fake = FakeHTTP({"authentication": [response(body=auth)]})
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=adapted_fake.send):
+                    with self.assertRaises(HLTBFailure) as caught:
+                        HLTBTransport(emit=self.output.write).search("Portal", "original", 1)
+                self.assertEqual((caught.exception.phase, caught.exception.kind), ("authentication", kind))
+                self.assertFalse(any(phase == "search" for phase, _, _ in adapted_fake.calls))
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_partial_formats_match_original_parser_without_inventing_fields(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        cases = [
+            {"token": "SECRET_TOKEN"},
+            {"token": "SECRET_TOKEN", "data": {"hpKey": "SECRET_KEY", "hpVal": "SECRET_VALUE"}},
+            {"token": "SECRET_TOKEN", "auth": {"key": "SECRET_KEY", "value": "SECRET_VALUE"}},
+            {"token": "SECRET_TOKEN", "k": "SECRET_KEY", "v": "SECRET_VALUE"},
+            {"TOKEN": "SECRET_TOKEN", "HPKEY": "SECRET_KEY", "HPVAL": "SECRET_VALUE"},
+            {"token": "SECRET_TOKEN", "hpKey": "SECRET_KEY", "hpVal": "SECRET_VALUE", "key": None, "value": None},
+        ]
+        for index, auth in enumerate(cases):
+            with self.subTest(format=index):
+                original = module.SearchAuthToken().extract_auth_token_from_json(auth)
+                fake = FakeHTTP({"authentication": [response(body=auth)]})
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=fake.send):
+                    transport = HLTBTransport(emit=self.output.write)
+                    with self.assertRaises(HLTBFailure) as caught:
+                        transport.search("Portal", "original", 1)
+                self.assertEqual(caught.exception.kind, "missing_fields")
+                expected = {
+                    name: {"available": value is not None, "type": type(value).__name__}
+                    for name, value in (("token", original.auth_token), ("key", original.auth_key), ("value", original.auth_value))
+                }
+                self.assertEqual(caught.exception.diagnostics["fields"], expected)
+                self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+        # With token only, the original library supplies unusable placeholders
+        # itself. Their construction is not proof the server accepts them.
+        original = module.SearchAuthToken().extract_auth_token_from_json({"token": "SECRET_TOKEN"})
+        headers = module.HTMLRequests.get_search_request_headers(original, "fixture-agent")
+        payload = json.loads(module.HTMLRequests.get_search_request_data("Portal", module.SearchModifiers.NONE, 1, original))
+        self.assertEqual((headers["x-hp-key"], headers["x-hp-val"]), ("None", "None"))
+        self.assertIn("null", payload)
+        self.assertIsNone(payload["null"])
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_case_and_nested_variants_are_diagnosed_without_remapping(self):
+        auth = {"token": "SECRET_TOKEN", "HPKEY": None, "HPVAL": None,
+                "data": {"hpKey": "SECRET_KEY", "hpVal": "SECRET_VALUE"}}
+        fake = FakeHTTP({"authentication": [response(body=auth)]})
+        self.http(fake)
+        with self.assertRaises(HLTBFailure) as caught:
+            HLTBTransport(emit=self.output.write).search("Portal", "original", 1)
+        diagnostics = caught.exception.diagnostics
+        self.assertEqual(diagnostics["case_variant_types"]["hpKey"], ["NoneType"])
+        self.assertEqual(diagnostics["nested_fields"]["data"]["fields"]["hpKey"], {"present": True, "type": "str"})
+        self.assertFalse(diagnostics["fields"]["key"]["available"])
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_conflicting_formats_keep_original_order_dependent_selection(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        plain = {"key": "SECRET_PLAIN_KEY", "value": "SECRET_PLAIN_VALUE"}
+        prefixed = {"hpKey": "SECRET_PREFIXED_KEY", "hpVal": "SECRET_PREFIXED_VALUE"}
+        for auth, expected in (({"token": "SECRET_TOKEN", **plain, **prefixed}, prefixed),
+                               ({"token": "SECRET_TOKEN", **prefixed, **plain}, plain)):
+            original = module.SearchAuthToken().extract_auth_token_from_json(auth)
+            self.assertEqual(original.auth_key, next(iter(expected.values())))
+            self.assertEqual(original.auth_value, list(expected.values())[1])
+            transport = self.compare_original_and_instrumented(auth)
+            candidates = transport.records[-2]["authentication_diagnostics"]["parser_candidates"]
+            self.assertEqual((candidates["key"]["count"], candidates["value"]["count"]), (2, 2))
+
+    def test_diagnostics_never_log_arbitrary_response_names_or_values(self):
+        auth = {"token": "SECRET_TOKEN", "hpKey": "SECRET_KEY", "hpVal": "SECRET_VALUE",
+                "SECRET_OTHER_KEY": "SECRET_OTHER_VALUE", "SECRET_NAME": "SECRET_BODY",
+                "authentication": {"hpKey": "SECRET_NESTED_KEY", "SECRET_FIELD": "SECRET_NESTED_BODY"}}
+        transport = self.compare_original_and_instrumented(auth)
+        shape = transport.records[-2]["authentication_diagnostics"]
+        self.assertEqual(shape["parser_candidates"]["key"]["count"], 2)
+        self.assertNotIn("SECRET", json.dumps(shape))
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_dynamic_endpoint_is_identical_to_original(self):
+        for endpoint in ("/api/finder/v2", "/api/another/search"):
+            with self.subTest(endpoint=endpoint):
+                self.compare_original_and_instrumented({"token": "SECRET_TOKEN", "hpKey": "SECRET_KEY", "hpVal": "SECRET_VALUE"}, endpoint=endpoint)
+
+
+class HLTBProbeTests(OfflineTest):
+    def run_probe(self, failures=None):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/update-global-metadata.yml"
+        scripts = re.findall(r"python -u - <<'PY'[^\n]*\n(.*?)^          PY$", workflow.read_text(), re.S | re.M)
+        self.assertEqual(len(scripts), 1)
+        script = compile(textwrap.dedent(scripts[0]), str(workflow) + ":hltb_probe", "exec")
+        clock = FakeClock()
+        fake = TimedHTTP(clock, failures=failures)
+        self.http(fake)
+        self.sleep.side_effect = clock.sleep
+        original = HLTBTransport.search
+        with patch.object(builder.time, "monotonic", side_effect=clock.monotonic), \
+             patch.object(builder.time, "time", side_effect=clock.wall_time), \
+             patch.object(sys, "path", list(sys.path)), \
+             patch.object(builder, "search_hltb_global", side_effect=AssertionError("Builder forbidden")), \
+             patch.object(matcher, "_search_hltb", side_effect=AssertionError("Matcher fallbacks forbidden")), \
+             patch.object(sqlite3, "connect", side_effect=AssertionError("SQLite forbidden")), \
+             patch.object(HLTBTransport, "search", autospec=True, side_effect=original) as search:
+            with self.assertRaises(SystemExit) as caught:
+                exec(script, {"__name__": "__main__"})
+        search.assert_called_once()
+        self.assertEqual(search.call_args.args[1:], ("Jump of Icarus",))
+        self.assertEqual(search.call_args.kwargs, {"matching_phase": "original", "attempt": 1})
+        starts = [event[0] for event in fake.dispatches]
+        self.assertTrue(all(second - first >= 1 for first, second in zip(starts, starts[1:])))
+        records = []
+        prefixes = {
+            "[hltb-http] ": {"request", "phase", "status", "failure", "authentication_diagnostics"},
+            "[hltb-search] ": {"phase", "failure", "status", "failure_diagnostics"},
+            "[hltb-http-summary] ": {"requests", "search_attempts", "outcomes"},
+            "[hltb-probe] ": {"phase", "failure", "exception_type"},
+        }
+        for line in self.output.getvalue().splitlines():
+            prefix = next(prefix for prefix in prefixes if line.startswith(prefix))
+            record = json.loads(line[len(prefix):])
+            self.assertLessEqual(record.keys(), prefixes[prefix])
+            records.append((prefix, record))
+        summary = next(record for prefix, record in records if prefix == "[hltb-http-summary] ")
+        self.assertEqual(summary["search_attempts"], 1)
+        self.assertEqual(summary["requests"], len(fake.dispatches))
+        self.assertNotIn("SECRET", self.output.getvalue())
+        self.assertNotIn("Jump of Icarus", self.output.getvalue())
+        self.assertNotIn("Traceback", self.output.getvalue())
+        return caught.exception.code, fake, records
+
+    def test_empty_search_result_does_not_trigger_fallbacks(self):
+        code, fake, _ = self.run_probe()
+        self.assertEqual(code, 0)
+        self.assertEqual([event[0] for event in fake.dispatches], [100, 101, 102, 103])
+        self.assertEqual([phase for phase, _, _ in fake.calls], ["discovery", "script", "authentication", "search"])
+
+    def test_missing_auth_fields_stop_before_post_without_retry(self):
+        code, fake, records = self.run_probe({"authentication": [response(body={"token": "SECRET_TOKEN"})]})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(fake.dispatches), 3)
+        self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+        search = next(record for prefix, record in records if prefix == "[hltb-search] ")
+        self.assertEqual((search["phase"], search["failure"], search["status"]), ("authentication", "missing_fields", 200))
+        fields = search["failure_diagnostics"]["json_fields"]
+        self.assertEqual(fields["token"], {"present": True, "type": "str"})
+        self.assertEqual(fields["hpKey"], {"present": False, "type": None})
+
+    def test_http_failure_has_no_retry_or_extra_request(self):
+        code, fake, records = self.run_probe({"authentication": [response(429, "SECRET_BODY", {"Retry-After": "30"})]})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(fake.dispatches), 3)
+        search = next(record for prefix, record in records if prefix == "[hltb-search] ")
+        self.assertEqual((search["failure"], search["status"]), ("http", 429))
+        self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+
+    def test_unexpected_exception_is_sanitised_without_retry(self):
+        with patch("hltb_transport.HowLongToBeat.search", side_effect=RuntimeError("SECRET_EXCEPTION_MESSAGE")):
+            code, fake, records = self.run_probe()
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.dispatches, [])
+        failure = next(record for prefix, record in records if prefix == "[hltb-probe] ")
+        self.assertEqual((failure["failure"], failure["exception_type"]), ("probe_exception", "RuntimeError"))
 
 
 class HTTPThrottleTests(OfflineTest):

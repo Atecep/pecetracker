@@ -140,6 +140,48 @@ class HTTPThrottle:
 HLTB_HTTP_THROTTLE = HTTPThrottle()
 
 
+def _authentication_response_shape(data):
+    """Describe known JSON fields without exposing values or arbitrary names.
+
+    1.0.23 reads token exactly and selects the last top-level name containing
+    key or val (case insensitive). These diagnostics do not change that parser
+    or supply missing fields; nested/case variants are observations only.
+    """
+    known = ("token", "key", "value", "hpKey", "hpVal")
+
+    def fields(obj):
+        return {
+            name: {"present": name in obj, "type": type(obj[name]).__name__ if name in obj else None}
+            for name in known
+        }
+
+    candidates = {"key": [], "value": []}
+    for name, value in data.items():
+        lower = name.lower()
+        if "key" in lower:
+            candidates["key"].append(type(value).__name__)
+        elif "val" in lower:
+            candidates["value"].append(type(value).__name__)
+    case_variants = {
+        name: sorted({type(value).__name__ for key, value in data.items()
+                      if key != name and key.lower() == name.lower()})
+        for name in known
+    }
+    return {
+        "json_fields": fields(data),
+        "case_variant_types": case_variants,
+        "parser_candidates": {
+            name: {"count": len(types), "types": sorted(set(types)), "selected_type": types[-1] if types else None}
+            for name, types in candidates.items()
+        },
+        "nested_fields": {
+            name: {"type": type(data[name]).__name__,
+                   "fields": fields(data[name]) if isinstance(data[name], dict) else None}
+            for name in ("data", "auth", "authentication") if name in data
+        },
+    }
+
+
 class _HLTBHTTPAdapter(requests.adapters.HTTPAdapter):
     """Intercept each dispatch, while Requests retains redirect semantics."""
     def __init__(self, transport):
@@ -268,6 +310,7 @@ class HLTBTransport:
                 }
                 if not isinstance(data, dict):
                     raise HLTBFailure(phase, "unexpected_type", response.status_code)
+                record["authentication_diagnostics"].update(_authentication_response_shape(data))
             if phase == "search":
                 try:
                     data = json.loads(response.text)

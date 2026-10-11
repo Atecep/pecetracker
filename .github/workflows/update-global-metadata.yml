@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Production update or isolated HLTB validation (up to 50 games)"
+        description: "Production update, isolated HLTB validation (up to 50 games), or single search probe"
         type: choice
         required: true
         default: production
         options:
           - production
           - hltb_validation
+          - hltb_probe
       steam_limit:
         description: "Steam games to process in production mode only"
         required: true
@@ -758,7 +759,7 @@ jobs:
           retention-days: 7
 
   validate-hltb:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'hltb_validation' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'hltb_validation' || inputs.mode == 'hltb_probe') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -767,6 +768,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       VALIDATION_DIR: ${{ github.workspace }}/hltb-validation
+      PROBE_DIR: ${{ github.workspace }}/hltb-probe
 
     steps:
       - name: Check out repository
@@ -787,9 +789,11 @@ jobs:
           python -m pip install -r global_metadata/requirements.txt
 
       - name: Prepare isolated validation directory
+        if: ${{ inputs.mode == 'hltb_validation' }}
         run: mkdir -p "$VALIDATION_DIR/source"
 
       - name: Download and verify source snapshot
+        if: ${{ inputs.mode == 'hltb_validation' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -805,6 +809,7 @@ jobs:
           } 2>&1 | tee "$VALIDATION_DIR/source-verification.log"
 
       - name: Create test SQLite from read-only snapshot
+        if: ${{ inputs.mode == 'hltb_validation' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -824,6 +829,7 @@ jobs:
           PY
 
       - name: Run HLTB diagnostic batch (no Steam requests)
+        if: ${{ inputs.mode == 'hltb_validation' }}
         timeout-minutes: 60
         shell: bash
         run: |
@@ -837,7 +843,7 @@ jobs:
             2>&1 | tee "$VALIDATION_DIR/diagnostics.log"
 
       - name: Checkpoint test SQLite and record suspension state
-        if: ${{ always() }}
+        if: ${{ always() && inputs.mode == 'hltb_validation' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -867,7 +873,7 @@ jobs:
           PY
 
       - name: Save HLTB diagnostic logs
-        if: ${{ always() }}
+        if: ${{ always() && inputs.mode == 'hltb_validation' }}
         uses: actions/upload-artifact@v4
         with:
           name: hltb-validation-logs-${{ github.run_id }}-${{ github.run_attempt }}
@@ -876,7 +882,7 @@ jobs:
           retention-days: 7
 
       - name: Save test SQLite including suspension state
-        if: ${{ always() }}
+        if: ${{ always() && inputs.mode == 'hltb_validation' }}
         uses: actions/upload-artifact@v4
         with:
           name: hltb-validation-sqlite-${{ github.run_id }}-${{ github.run_attempt }}
@@ -884,5 +890,63 @@ jobs:
             ${{ env.VALIDATION_DIR }}/hltb-validation.db
             ${{ env.VALIDATION_DIR }}/hltb-validation.db-wal
             ${{ env.VALIDATION_DIR }}/hltb-validation.db-shm
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Prepare isolated probe directory
+        if: ${{ inputs.mode == 'hltb_probe' }}
+        run: mkdir -p "$PROBE_DIR"
+
+      - name: Run single HLTB authentication probe
+        if: ${{ inputs.mode == 'hltb_probe' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -u - <<'PY' 2>&1 | tee "$PROBE_DIR/diagnostics.log"
+          import json
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, str(Path("global_metadata").resolve()))
+          from hltb_transport import HLTBFailure, HLTBTransport, HTTPThrottle
+
+          allowed = {
+              "[hltb-http] ": ("request", "phase", "status", "failure", "authentication_diagnostics"),
+              "[hltb-search] ": ("phase", "failure", "status", "failure_diagnostics"),
+              "[hltb-http-summary] ": ("requests", "search_attempts", "outcomes"),
+          }
+
+          def emit_safe(line):
+              for prefix, keys in allowed.items():
+                  if line.startswith(prefix):
+                      record = json.loads(line[len(prefix):])
+                      print(prefix + json.dumps({key: record[key] for key in keys if key in record}, sort_keys=True))
+                      return
+
+          transport = HLTBTransport(emit=emit_safe, throttle=HTTPThrottle(1.0))
+          exit_code = 0
+          try:
+              transport.search("Jump of Icarus", matching_phase="original", attempt=1)
+          except HLTBFailure:
+              exit_code = 1
+          except Exception as error:
+              # Do not print exception messages or tracebacks containing data.
+              print("[hltb-probe] " + json.dumps({
+                  "phase": transport.phase, "failure": "probe_exception",
+                  "exception_type": type(error).__name__,
+              }, sort_keys=True))
+              exit_code = 1
+          finally:
+              transport.log_summary()
+          raise SystemExit(exit_code)
+          PY
+
+      - name: Save single-search diagnostic logs
+        if: ${{ always() && inputs.mode == 'hltb_probe' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hltb-probe-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.PROBE_DIR }}/diagnostics.log
           if-no-files-found: warn
           retention-days: 7
