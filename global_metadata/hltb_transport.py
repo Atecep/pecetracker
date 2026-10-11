@@ -41,12 +41,13 @@ def retry_after_seconds(value, now=None):
 
 
 class HLTBFailure(RuntimeError):
-    def __init__(self, phase, kind, status=None, retry_after=None, global_candidate=True):
+    def __init__(self, phase, kind, status=None, retry_after=None, global_candidate=True, diagnostics=None):
         self.phase = phase
         self.kind = kind
         self.status = status
         self.retry_after = retry_after
         self.global_candidate = global_candidate
+        self.diagnostics = diagnostics or {}
         # Do not embed underlying exception messages, URLs or response bodies.
         super().__init__(f"HLTB {phase}: {kind}" + (f" (HTTP {status})" if status is not None else ""))
 
@@ -256,6 +257,17 @@ class HLTBTransport:
                         or response.status_code in (401, 403, 404, 408, 429)
                         or response.status_code >= 500 or requested is not None,
                     )
+            if phase == "authentication":
+                try:
+                    data = response.json()
+                except ValueError:
+                    record["authentication_diagnostics"] = {"json_valid": False}
+                    raise HLTBFailure(phase, "invalid_json", response.status_code) from None
+                record["authentication_diagnostics"] = {
+                    "json_valid": True, "json_type": type(data).__name__,
+                }
+                if not isinstance(data, dict):
+                    raise HLTBFailure(phase, "unexpected_type", response.status_code)
             if phase == "search":
                 try:
                     data = json.loads(response.text)
@@ -289,19 +301,48 @@ class HLTBTransport:
             return result
 
         def authenticate(url, user_agent):
+            def fail(kind, **diagnostics):
+                record = next((r for r in reversed(self.records) if r["phase"] == "authentication"), None)
+                if record is not None:
+                    record.setdefault("authentication_diagnostics", {}).update(diagnostics)
+                return HLTBFailure(
+                    "authentication", kind, record["status"] if record else None,
+                    diagnostics=record["authentication_diagnostics"] if record else diagnostics,
+                )
+
             try:
                 result = authentication.__func__(url, user_agent)
-            except json.JSONDecodeError:
-                raise HLTBFailure("authentication", "invalid_json", 200) from None
-            except (ValueError, TypeError, AttributeError):
-                raise HLTBFailure("authentication", "invalid_response", 200) from None
-            if (
-                result is None
-                or not isinstance(result.auth_token, str) or not result.auth_token
-                or not isinstance(result.auth_key, str) or not result.auth_key
-                or result.auth_value is None
+            except HLTBFailure:
+                raise
+            except Exception as error:
+                # The response has already passed JSON/HTTP validation. An
+                # exception here originates in the library's extraction code.
+                raise fail("library_exception", exception_type=type(error).__name__) from None
+            if result is None:
+                raise fail("missing_fields", result_type="NoneType")
+            if not isinstance(result, module.SearchAuthToken):
+                raise fail("adapter_incompatibility", result_type=type(result).__name__)
+            fields = {
+                "token": result.auth_token, "key": result.auth_key, "value": result.auth_value,
+            }
+            diagnostics = {"fields": {
+                name: {"available": value is not None, "type": type(value).__name__}
+                for name, value in fields.items()
+            }}
+            # Record only logical field names, availability and types. Never
+            # include response field names, authentication values or headers.
+            record = next((r for r in reversed(self.records) if r["phase"] == "authentication"), None)
+            if record is not None:
+                record.setdefault("authentication_diagnostics", {}).update(diagnostics)
+            if any(value is None for value in fields.values()) or any(
+                isinstance(fields[name], str) and not fields[name] for name in ("token", "key")
             ):
-                raise HLTBFailure("authentication", "invalid_response", 200)
+                raise fail("missing_fields")
+            # 1.0.23 stringifies header values and JSON-serialises the key in
+            # the payload. Numeric keys/tokens therefore work in the original
+            # library and must not be rejected by this adapter.
+            if any(not isinstance(fields[name], (str, int, float, bool)) for name in ("token", "key")):
+                raise fail("unexpected_type")
             return result
 
         module.requests = SimpleNamespace(
@@ -344,7 +385,9 @@ class HLTBTransport:
             failure = HLTBFailure(self.phase, "parsing", global_candidate=self.phase != "search")
             raise failure from None
         finally:
-            if failure is not None and self.records:
+            if failure is not None and self.records and not (
+                failure.phase == "authentication" and self.records[-1]["phase"] != "authentication"
+            ):
                 self.records[-1]["failure"] = failure.kind
             for record in self.records:
                 self.counts[(record["phase"], record["status"], record["failure"])] += 1
@@ -354,6 +397,7 @@ class HLTBTransport:
                 "duration_seconds": round(time.monotonic() - started, 4),
                 "phase": failure.phase if failure else "search",
                 "failure": failure.kind if failure else None,
+                "failure_diagnostics": failure.diagnostics if failure else None,
                 "status": failure.status if failure else None,
                 "retry_after_seconds": failure.retry_after if failure else None,
                 "results": len(results) if results is not None else None,

@@ -1,6 +1,7 @@
 """Baseline and global-builder regression tests. All HTTP is mocked."""
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
+from email.message import Message
 import importlib
 import io
 import json
@@ -346,7 +347,7 @@ class TransportTests(OfflineTest):
             ("discovery", "no scripts", "endpoint_not_found"),
             ("script", "no endpoint", "endpoint_not_found"),
             ("authentication", "not JSON", "invalid_json"),
-            ("authentication", {}, "invalid_response"),
+            ("authentication", {}, "missing_fields"),
             ("search", "not JSON", "invalid_json"),
             ("search", {}, "invalid_response"),
             ("search", {"data": None}, "invalid_response"),
@@ -388,6 +389,172 @@ class TransportTests(OfflineTest):
         self.assertEqual(transport.requests, 5)
         self.assertEqual(sum(transport.counts.values()), 5)
         self.assertNotIn("SECRET", self.output.getvalue())
+
+
+class AuthenticationTests(OfflineTest):
+    def compare_original_and_instrumented(self, auth, redirects=False):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        from howlongtobeatpy import HowLongToBeat
+        calls = []
+        for instrumented in (False, True):
+            failures = {"authentication": [response(body=auth)]}
+            if redirects:
+                redirected = response(302, "", {
+                    "Location": "/api/search/site/init?redirected=1",
+                    "Set-Cookie": "fixture=SECRET_COOKIE; Path=/",
+                })
+                headers = Message()
+                headers["Set-Cookie"] = "fixture=SECRET_COOKIE; Path=/"
+                redirected.raw = SimpleNamespace(_original_response=SimpleNamespace(msg=headers))
+                failures["authentication"].insert(0, redirected)
+            fake = FakeHTTP(failures)
+            prepared = []
+
+            def send(request, **kwargs):
+                # Compare sensitive data in memory only; never print it.
+                prepared.append((request.method, request.url, dict(request.headers), request.body, kwargs))
+                return fake.send(request, **kwargs)
+
+            original_url = module.HTMLRequests.SEARCH_URL
+            try:
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=send), patch.object(module.time, "time", return_value=1800000000):
+                    if instrumented:
+                        transport = HLTBTransport(emit=self.output.write)
+                        result = transport.search("Portal", "original", 1)
+                    else:
+                        result = HowLongToBeat(0.4).search("Portal", similarity_case_sensitive=False)
+                self.assertEqual(result, [])
+            finally:
+                module.HTMLRequests.SEARCH_URL = original_url
+            self.assertEqual(sum(phase == "search" for phase, _, _ in fake.calls), 1)
+            calls.append(prepared)
+        # Equality covers URLs, params, user agent, headers, body and Requests
+        # options, plus cookies/methods across redirects when enabled.
+        self.assertEqual(calls[0], calls[1])
+        if redirects:
+            # The cookie follows the auth redirect, but per-call sessions do
+            # not carry it into the search POST in either implementation.
+            self.assertIn("SECRET_COOKIE", calls[1][-2][2]["Cookie"])
+            self.assertNotIn("Cookie", calls[1][-1][2])
+        self.assertNotIn("SECRET", self.output.getvalue())
+        return transport
+
+    def test_numeric_authentication_matches_original_and_reaches_post(self):
+        for token, key, value in (
+            ("SECRET_TOKEN", 12345, 67890),
+            (12345, "SECRET_KEY", 67890),
+            (12345, 67890, 0),
+            (12345.5, 67890.5, False),
+            (True, False, 0),
+            ("SECRET_TOKEN", "SECRET_KEY", ""),
+            ("SECRET_TOKEN", "SECRET_KEY", {"nested": "SECRET_VALUE"}),
+        ):
+            with self.subTest(types=[type(field).__name__ for field in (token, key, value)]):
+                transport = self.compare_original_and_instrumented({"token": token, "hpKey": key, "hpVal": value})
+                fields = transport.records[-2]["authentication_diagnostics"]["fields"]
+                self.assertEqual(fields["key"], {"available": True, "type": type(key).__name__})
+                self.assertEqual(transport.requests, 4)
+
+    def test_string_authentication_matches_original(self):
+        self.compare_original_and_instrumented({"token": "SECRET_TOKEN", "key": "SECRET_KEY", "value": "SECRET_VALUE"})
+
+    def test_numeric_authentication_preserves_successful_match(self):
+        fake = FakeHTTP(
+            failures={"authentication": [
+                response(body={"token": "SECRET_TOKEN", "hpKey": 12345, "hpVal": 67890})
+                for _ in range(2)
+            ]},
+            games={"Portal": [{
+                "game_id": 20, "game_name": "Portal", "release_world": 2007,
+                "comp_main": 36000, "comp_plus": 55800, "comp_100": 79200, "comp_all": 43200,
+            }]},
+        )
+        self.http(fake)
+        before = matcher._search_hltb("Portal")
+        after = builder.search_hltb_global("Portal")
+        self.assertEqual(after, before)
+        self.assertEqual(after["hltb_id"], 20)
+        self.assertEqual((after["main_story"], after["main_extra"], after["completionist"], after["all_styles"]),
+                         (10.0, 15.5, 22.0, 12.0))
+        self.assertEqual(sum(phase == "search" for phase, _, _ in fake.calls), 2)
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_authentication_redirects_and_cookies_match_original(self):
+        transport = self.compare_original_and_instrumented({"token": "SECRET_TOKEN", "hpKey": 12345, "hpVal": 67890}, redirects=True)
+        self.assertEqual(transport.requests, 5)
+
+    def test_missing_fields_and_unexpected_types_are_distinguished(self):
+        valid = {"token": "SECRET_TOKEN", "hpKey": 12345, "hpVal": 67890}
+        cases = [("SECRET_INVALID_JSON", "invalid_json"), ([], "unexpected_type"), (None, "unexpected_type")]
+        for field in valid:
+            missing = {key: value for key, value in valid.items() if key != field}
+            cases.extend([(missing, "missing_fields"), ({**valid, field: None}, "missing_fields")])
+        cases.extend([({**valid, "hpKey": []}, "unexpected_type"), ({**valid, "token": {}}, "unexpected_type")])
+        for auth, kind in cases:
+            with self.subTest(kind=kind):
+                fake = FakeHTTP({"authentication": [response(body=auth)]})
+                with patch("requests.adapters.HTTPAdapter.send", side_effect=fake.send):
+                    transport = HLTBTransport(emit=self.output.write)
+                    with self.assertRaises(HLTBFailure) as caught:
+                        transport.search("Portal", "original", 1)
+                self.assertEqual((caught.exception.phase, caught.exception.kind, caught.exception.status), ("authentication", kind, 200))
+                self.assertTrue(caught.exception.global_candidate)
+                self.assertEqual(transport.records[-1]["failure"], kind)
+                self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_library_exceptions_keep_safe_type_and_actual_status(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        self.http(FakeHTTP())
+        for exception in (ValueError, TypeError, AttributeError, KeyError, RuntimeError):
+            with self.subTest(exception=exception.__name__), patch.object(module.SearchAuthToken, "extract_auth_token_from_response", side_effect=exception("SECRET_EXCEPTION_MESSAGE")):
+                transport = HLTBTransport(emit=self.output.write)
+                with self.assertRaises(HLTBFailure) as caught:
+                    transport.search("Portal", "original", 1)
+                self.assertEqual((caught.exception.kind, caught.exception.status), ("library_exception", 200))
+                diagnostics = transport.records[-1]["authentication_diagnostics"]
+                self.assertEqual(diagnostics["exception_type"], exception.__name__)
+                self.assertNotIn("SECRET", str(caught.exception))
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_unexpected_library_return_is_adapter_incompatibility(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        self.http(FakeHTTP())
+        with patch.object(module.SearchAuthToken, "extract_auth_token_from_response", return_value="SECRET_UNEXPECTED_RESULT"):
+            transport = HLTBTransport(emit=self.output.write)
+            with self.assertRaises(HLTBFailure) as caught:
+                transport.search("Portal", "original", 1)
+        self.assertEqual((caught.exception.kind, caught.exception.status), ("adapter_incompatibility", 200))
+        self.assertEqual(transport.records[-1]["authentication_diagnostics"]["result_type"], "str")
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_internal_failure_before_http_does_not_invent_http_200(self):
+        module = importlib.import_module("howlongtobeatpy.HTMLRequests")
+        self.http(FakeHTTP())
+        with patch.object(module.HTMLRequests, "get_auth_token_request_params", side_effect=RuntimeError("SECRET_EXCEPTION_MESSAGE")):
+            transport = HLTBTransport(emit=self.output.write)
+            with self.assertRaises(HLTBFailure) as caught:
+                transport.search("Portal", "original", 1)
+        self.assertEqual((caught.exception.phase, caught.exception.kind, caught.exception.status), ("authentication", "library_exception", None))
+        self.assertEqual(transport.requests, 2)
+        self.assertTrue(all(record["failure"] is None for record in transport.records))
+        self.assertEqual(caught.exception.diagnostics, {"exception_type": "RuntimeError"})
+        self.assertIn('"exception_type": "RuntimeError"', self.output.getvalue())
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_consecutive_auth_failures_suspend_and_recovery_resets(self):
+        fake = FakeHTTP({"authentication": [response(body={}) for _ in range(3)]})
+        self.http(fake)
+        protection = ServiceProtection()
+        transport = HLTBTransport(emit=self.output.write)
+        with self.assertRaises(HLTBFailure):
+            builder.search_hltb_global("Portal", transport=transport, protection=protection)
+        with self.assertRaises(HLTBSuspended):
+            builder.search_hltb_global("Missing", transport=transport, protection=protection)
+        self.assertEqual((transport.requests, transport.attempts), (9, 3))
+        self.assertFalse(any(phase == "search" for phase, _, _ in fake.calls))
+        self.assertIsNone(builder.search_hltb_global("Portal", transport=transport, protection=protection))
+        self.assertEqual(protection.failures, 0)
 
 
 class HTTPThrottleTests(OfflineTest):
