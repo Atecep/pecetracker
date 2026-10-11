@@ -766,7 +766,7 @@ jobs:
 
     env:
       GH_TOKEN: ${{ github.token }}
-      VALIDATION_DIR: ${{ runner.temp }}/hltb-validation
+      VALIDATION_DIR: ${{ github.workspace }}/hltb-validation
 
     steps:
       - name: Check out repository
