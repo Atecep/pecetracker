@@ -83,7 +83,7 @@ jobs:
           python global_metadata/build_global_database.py \
             --steam-limit "$STEAM_LIMIT" \
             --hltb-limit "$HLTB_LIMIT" \
-            --hltb-pause 1.8
+            --hltb-pause 1.9
 
       - name: Checkpoint and verify SQLite database
         run: |
