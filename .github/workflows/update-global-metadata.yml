@@ -75,7 +75,7 @@ jobs:
             echo "HLTB_LIMIT=${{ inputs.hltb_limit }}" >> "$GITHUB_ENV"
           else
             echo "STEAM_LIMIT=2500" >> "$GITHUB_ENV"
-            echo "HLTB_LIMIT=1200" >> "$GITHUB_ENV"
+            echo "HLTB_LIMIT=1300" >> "$GITHUB_ENV"
           fi
 
       - name: Update global metadata
