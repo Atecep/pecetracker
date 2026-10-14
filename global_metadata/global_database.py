@@ -8,7 +8,6 @@ from pathlib import Path
 from constants import (
     HLTB_CACHE_MAX_AGE_DAYS,
     HLTB_MATCHER_VERSION,
-    HLTB_NO_MATCH_CACHE_DAYS,
 )
 
 
@@ -23,6 +22,10 @@ STEAM_UNAVAILABLE_RETRY_DAYS = 30
 # without calling /api/appdetails again.
 GLOBAL_STEAM_DETAILS_MAX_AGE_DAYS = 365
 GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS = 90
+
+# Global-only HLTB no-match refresh policy. The desktop app retains its
+# separate 30-day HLTB_NO_MATCH_CACHE_DAYS setting from constants.py.
+GLOBAL_HLTB_NO_MATCH_CACHE_DAYS = 90
 
 
 def _now():
@@ -607,7 +610,7 @@ def save_steam_unavailable(db_path, appid):
 
 def hltb_candidates(db_path, limit):
     matched_cutoff = _cutoff_iso(HLTB_CACHE_MAX_AGE_DAYS)
-    no_match_cutoff = _cutoff_iso(HLTB_NO_MATCH_CACHE_DAYS)
+    no_match_cutoff = _cutoff_iso(GLOBAL_HLTB_NO_MATCH_CACHE_DAYS)
     now = _now_iso()
 
     with connect(db_path) as conn:

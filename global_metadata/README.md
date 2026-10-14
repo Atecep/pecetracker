@@ -66,3 +66,25 @@ returned.
 
 Steam metadata and HLTB metadata are populated incrementally and can resume
 across runs.
+
+## GitHub Actions maintenance
+
+After the initial bootstrap, the workflow runs twice daily:
+04:12 and 16:12 UTC.
+
+Scheduled limits:
+- Steam: 2500 games
+- HLTB: 1300 games
+- HLTB throttle: 1.9 seconds
+
+Global metadata refresh:
+- Steam details: 365 days or catalogue changes
+- Steam reviews: 90 days
+- HLTB matched: 180 days
+- HLTB no_match: 90 days
+- HLTB errors: retry cooldowns of 1h, 6h or 24h
+
+The desktop application's local HLTB no_match cache
+remains at 30 days.
+
+Only eligible records are refreshed during maintenance.

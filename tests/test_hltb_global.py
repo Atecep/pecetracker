@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "global_metadata"))
 import build_global_database as builder
 import global_database as db
 import hltb_service as matcher
+import constants as app_constants
 
 
 def entry(game_id, name, similarity=1.0, year=2020, main=10.0):
@@ -439,11 +440,14 @@ class SQLiteProgressTests(OfflineTest):
             builder.update_hltb(self.path, limit=3, pause_seconds=2)
         self.assertEqual(self.rows(), [(1, 0, 0, None), (2, 0, 0, None), (3, 0, 0, None)])
 
-    def test_matched_and_no_match_ttls_remain_180_and_30_days(self):
-        self.assertEqual((db.HLTB_CACHE_MAX_AGE_DAYS, db.HLTB_NO_MATCH_CACHE_DAYS), (180, 30))
+    def test_global_hltb_ttls_and_local_no_match_ttl_are_separate(self):
+        self.assertEqual(db.HLTB_CACHE_MAX_AGE_DAYS, 180)
+        self.assertEqual(db.GLOBAL_HLTB_NO_MATCH_CACHE_DAYS, 90)
+        self.assertEqual(app_constants.HLTB_NO_MATCH_CACHE_DAYS, 30)
+        self.assertEqual(matcher.HLTB_NO_MATCH_CACHE_DAYS, 30)
         db.save_hltb_match(self.path, 1, "Portal", self.result())
         db.save_hltb_no_match(self.path, 2, "Missing")
-        for days, expected in ((29, [3]), (31, [2, 3]), (181, [1, 2, 3])):
+        for days, expected in ((29, [3]), (31, [3]), (89, [3]), (91, [2, 3]), (181, [1, 2, 3])):
             with self.subTest(days=days), patch.object(db, "_now", return_value=self.now + timedelta(days=days)):
                 self.assertEqual(sorted(row["appid"] for row in db.hltb_candidates(self.path, 3)), expected)
 
