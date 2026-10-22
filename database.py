@@ -5,7 +5,7 @@ from datetime import datetime
 from app_paths import DATABASE_PATH, ensure_data_dir
 from sqlite_support import ClosingConnection
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CONNECTION_TIMEOUT = 5.0
 _UNSET = object()
 
@@ -124,6 +124,13 @@ def init_database():
             conn.execute(
                 "ALTER TABLE hltb_metadata ADD COLUMN matcher_version INTEGER"
             )
+
+        metadata_columns = {row[1] for row in conn.execute("PRAGMA table_info(game_metadata)")}
+        if "reviews_fetched_at" not in metadata_columns:
+            conn.execute("ALTER TABLE game_metadata ADD COLUMN reviews_fetched_at TEXT")
+            conn.execute("""UPDATE game_metadata SET reviews_fetched_at = fetched_at
+                WHERE review_score IS NOT NULL OR review_description IS NOT NULL
+                   OR positive_percentage IS NOT NULL OR total_reviews IS NOT NULL""")
 
         # Migrate the old experimental label to the more accurate state name.
         conn.execute("""
@@ -262,6 +269,7 @@ def get_game_metadata(appid):
                 positive_percentage,
                 total_reviews,
                 fetched_at
+                , reviews_fetched_at
 
             FROM game_metadata
 
@@ -303,6 +311,7 @@ def get_game_metadata(appid):
         "total_reviews": row[7],
 
         "fetched_at": row[8],
+        "reviews_fetched_at": row[9],
     }
 
 
@@ -330,6 +339,7 @@ def get_all_game_metadata():
                 positive_percentage,
                 total_reviews,
                 fetched_at
+                , reviews_fetched_at
 
             FROM game_metadata
         """)
@@ -348,101 +358,41 @@ def get_all_game_metadata():
             "positive_percentage": row[7],
             "total_reviews": row[8],
             "fetched_at": row[9],
+            "reviews_fetched_at": row[10],
         }
         for row in rows
     }
 
 
 def save_game_metadata(metadata):
-
-    reviews = (
-        metadata.get("reviews")
-        or {}
-    )
-
+    """Details and reviews have independent freshness; a failed review is absent."""
+    reviews = metadata.get("reviews")
+    now = datetime.now().isoformat(timespec="seconds")
+    values = {"appid": int(metadata["appid"]), "fetched_at": now,
+              "reviews_fetched_at": now if reviews is not None else None}
+    for field in ("genres", "categories", "developers", "publishers"):
+        values[field] = json.dumps(metadata.get(field) or [])
+    for field in ("review_score", "review_description", "positive_percentage", "total_reviews"):
+        values[field] = (reviews or {}).get(field)
     with get_connection() as conn:
-
         conn.execute("""
-            INSERT INTO game_metadata (
-                appid,
-                genres,
-                categories,
-                developers,
-                publishers,
-                review_score,
-                review_description,
-                positive_percentage,
-                total_reviews,
-                fetched_at
-            )
+            INSERT INTO game_metadata(appid,genres,categories,developers,publishers,
+                review_score,review_description,positive_percentage,total_reviews,
+                fetched_at,reviews_fetched_at)
+            VALUES(:appid,:genres,:categories,:developers,:publishers,
+                :review_score,:review_description,:positive_percentage,:total_reviews,
+                :fetched_at,:reviews_fetched_at)
+            ON CONFLICT(appid) DO UPDATE SET
+                genres=excluded.genres, categories=excluded.categories,
+                developers=excluded.developers, publishers=excluded.publishers,
+                fetched_at=excluded.fetched_at,
+                review_score=CASE WHEN excluded.reviews_fetched_at IS NOT NULL THEN excluded.review_score ELSE game_metadata.review_score END,
+                review_description=CASE WHEN excluded.reviews_fetched_at IS NOT NULL THEN excluded.review_description ELSE game_metadata.review_description END,
+                positive_percentage=CASE WHEN excluded.reviews_fetched_at IS NOT NULL THEN excluded.positive_percentage ELSE game_metadata.positive_percentage END,
+                total_reviews=CASE WHEN excluded.reviews_fetched_at IS NOT NULL THEN excluded.total_reviews ELSE game_metadata.total_reviews END,
+                reviews_fetched_at=COALESCE(excluded.reviews_fetched_at,game_metadata.reviews_fetched_at)
+        """, values)
 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
-            ON CONFLICT(appid)
-
-            DO UPDATE SET
-                genres = excluded.genres,
-                categories = excluded.categories,
-                developers = excluded.developers,
-                publishers = excluded.publishers,
-                review_score = excluded.review_score,
-                review_description = excluded.review_description,
-                positive_percentage = excluded.positive_percentage,
-                total_reviews = excluded.total_reviews,
-                fetched_at = excluded.fetched_at
-        """, (
-            int(
-                metadata["appid"]
-            ),
-
-            json.dumps(
-                metadata.get(
-                    "genres",
-                    []
-                )
-            ),
-
-            json.dumps(
-                metadata.get(
-                    "categories",
-                    []
-                )
-            ),
-
-            json.dumps(
-                metadata.get(
-                    "developers",
-                    []
-                )
-            ),
-
-            json.dumps(
-                metadata.get(
-                    "publishers",
-                    []
-                )
-            ),
-
-            reviews.get(
-                "review_score"
-            ),
-
-            reviews.get(
-                "review_description"
-            ),
-
-            reviews.get(
-                "positive_percentage"
-            ),
-
-            reviews.get(
-                "total_reviews"
-            ),
-
-            datetime.now().isoformat(
-                timespec="seconds"
-            )
-        ))
 
 def get_metadata_fetch_status(appid):
     """Return the persistent metadata fetch state for one AppID."""
@@ -778,10 +728,6 @@ def import_global_metadata(global_db_path, library_records):
             "hltb_imported": 0,
         }
 
-    imported_at = datetime.now().isoformat(
-        timespec="seconds"
-    )
-
     with get_connection() as conn:
         conn.execute(
             "ATTACH DATABASE ? AS global_metadata_db",
@@ -789,6 +735,8 @@ def import_global_metadata(global_db_path, library_records):
         )
 
         try:
+            source_columns = {row[1] for row in conn.execute("PRAGMA global_metadata_db.table_info(steam_metadata)")}
+            reviews_time = "s.reviews_fetched_at" if "reviews_fetched_at" in source_columns else "CASE WHEN s.total_reviews IS NOT NULL THEN s.fetched_at END"
             # Validate the columns this app version depends on.
             conn.execute(
                 """
@@ -846,7 +794,7 @@ def import_global_metadata(global_db_path, library_records):
             )
 
             conn.execute(
-                """
+                f"""
                 INSERT INTO game_metadata (
                     appid,
                     genres,
@@ -857,7 +805,7 @@ def import_global_metadata(global_db_path, library_records):
                     review_description,
                     positive_percentage,
                     total_reviews,
-                    fetched_at
+                    fetched_at, reviews_fetched_at
                 )
                 SELECT
                     s.appid,
@@ -869,7 +817,7 @@ def import_global_metadata(global_db_path, library_records):
                     s.review_description,
                     s.positive_percentage,
                     s.total_reviews,
-                    ?
+                    s.fetched_at, {reviews_time}
                 FROM global_metadata_db.steam_metadata AS s
                 INNER JOIN bootstrap_library_appids AS l
                     ON l.appid = s.appid
@@ -879,7 +827,6 @@ def import_global_metadata(global_db_path, library_records):
                     s.state = 'ready'
                     AND local.appid IS NULL
                 """,
-                (imported_at,),
             )
 
             steam_imported = int(
@@ -935,7 +882,7 @@ def import_global_metadata(global_db_path, library_records):
                     h.completionist,
                     h.all_styles,
                     h.web_link,
-                    ?
+                    h.fetched_at
                 FROM global_metadata_db.hltb_metadata AS h
                 INNER JOIN bootstrap_library_appids AS l
                     ON l.appid = h.appid
@@ -945,7 +892,6 @@ def import_global_metadata(global_db_path, library_records):
                     h.state IN ('matched', 'no_match')
                     AND local.appid IS NULL
                 """,
-                (imported_at,),
             )
 
             hltb_imported = int(

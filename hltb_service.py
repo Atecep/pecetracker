@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import html
 import re
 import threading
 import unicodedata
 
-from howlongtobeatpy import HowLongToBeat
+from cache_time import is_fresh
+from hltb_transport import client, search_budget
 
 from constants import (
     HLTB_CACHE_MAX_AGE_DAYS,
@@ -77,6 +77,9 @@ def _is_cache_fresh(metadata):
     ):
         return True
 
+    if state == "matched" and has_sequel_conflict(metadata.get("searched_name"), metadata.get("matched_name")):
+        return False
+
     # Matcher revisions are intended to improve unresolved/failed matches.
     # Do not invalidate an already successful match just because the matcher
     # version changed; otherwise every matcher tweak would make previously
@@ -95,18 +98,13 @@ def _is_cache_fresh(metadata):
     if not fetched_at:
         return False
 
-    try:
-        fetched_time = datetime.fromisoformat(fetched_at)
-    except (TypeError, ValueError):
-        return False
-
     max_age_days = (
         HLTB_NO_MATCH_CACHE_DAYS
         if state == "no_match"
         else HLTB_CACHE_MAX_AGE_DAYS
     )
 
-    return datetime.now() - fetched_time < timedelta(days=max_age_days)
+    return is_fresh(fetched_at, max_age_days)
 
 
 
@@ -206,6 +204,21 @@ def _normalise_title(name, strip_edition=False):
 def _title_tokens(name):
     normalised = _normalise_title(name)
     return normalised.split() if normalised else []
+
+
+def has_sequel_conflict(left, right):
+    """Do not lose an instalment number when trying shortened search queries."""
+    if not left or not right:
+        return False
+    roman = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+             "vii": 7, "viii": 8, "ix": 9, "x": 10, "xi": 11,
+             "xii": 12, "xiii": 13, "xiv": 14, "xv": 15, "xvi": 16}
+    def numbers(name):
+        tokens = _normalise_title(name, strip_edition=True).split()
+        return [int(token) if token.isdigit() else roman[token]
+                for index, token in enumerate(tokens)
+                if token.isdigit() or (index > 0 and token in roman)]
+    return numbers(left) != numbers(right)
 
 
 def _structural_title_match(left, right):
@@ -331,7 +344,7 @@ def _title_similarity(left, right):
 
 
 def _search_once(query):
-    results = HowLongToBeat(0.4).search(
+    results = client(0.4).search(
         query,
         similarity_case_sensitive=False,
     )
@@ -398,6 +411,8 @@ def _collect_candidates(game_name):
 
 
 def _evaluate_candidate(game_name, entry, wrapper_similarity):
+    if has_sequel_conflict(game_name, getattr(entry, "game_name", "")):
+        return None
     steam_year = _extract_year(game_name)
     hltb_year = _entry_release_year(entry)
 
@@ -571,7 +586,8 @@ def set_manual_hltb_metadata(appid, game_name, hltb_id):
         raise ValueError("HLTB ID must be greater than zero.")
 
     with _get_fetch_lock(appid):
-        entry = HowLongToBeat(0.0).search_from_id(hltb_id)
+        with search_budget():
+            entry = client(0.0).search_from_id(hltb_id)
 
         if entry is None:
             raise RuntimeError(
@@ -597,7 +613,7 @@ def set_manual_hltb_metadata(appid, game_name, hltb_id):
         return get_cached_hltb_metadata(appid)
 
 
-def get_hltb_metadata(appid, game_name, force_refresh=False):
+def get_hltb_metadata(appid, game_name, force_refresh=False, allow_fetch=True):
     """Return cached HLTB data, searching by Steam game name when needed."""
     appid = int(appid)
     game_name = str(game_name or "").strip()
@@ -606,6 +622,15 @@ def get_hltb_metadata(appid, game_name, force_refresh=False):
         return None
 
     cached = get_cached_hltb_metadata(appid)
+
+    if cached and cached.get("state") == "matched" and cached.get("match_confidence") == "manual":
+        return cached
+    if not allow_fetch:
+        if cached and cached.get("state") == "matched" and cached.get("match_confidence") != "manual" and has_sequel_conflict(
+            cached.get("searched_name"), cached.get("matched_name")
+        ):
+            return None
+        return cached
 
     if (
         cached is not None
@@ -616,6 +641,8 @@ def get_hltb_metadata(appid, game_name, force_refresh=False):
 
     with _get_fetch_lock(appid):
         cached = get_cached_hltb_metadata(appid)
+        if cached and cached.get("state") == "matched" and cached.get("match_confidence") == "manual":
+            return cached
 
         if (
             cached is not None
@@ -624,7 +651,8 @@ def get_hltb_metadata(appid, game_name, force_refresh=False):
         ):
             return cached
 
-        result = _search_hltb(game_name)
+        with search_budget():
+            result = _search_hltb(game_name)
 
         if result is None:
             save_hltb_metadata(

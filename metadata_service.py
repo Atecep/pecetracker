@@ -2,6 +2,8 @@ from datetime import datetime, timedelta
 import threading
 
 import requests
+from cache_time import is_fresh, parse_timestamp
+from datetime import timezone
 
 from constants import (
     METADATA_CACHE_MAX_AGE_DAYS,
@@ -36,19 +38,9 @@ def _get_fetch_lock(appid):
 
 
 def is_cache_fresh(metadata):
-    fetched_at = metadata.get("fetched_at")
-
-    if not fetched_at:
-        return False
-
-    try:
-        fetched_time = datetime.fromisoformat(fetched_at)
-    except (TypeError, ValueError):
-        return False
-
-    max_age = timedelta(days=METADATA_CACHE_MAX_AGE_DAYS)
-
-    return datetime.now() - fetched_time < max_age
+    return is_fresh(metadata.get("fetched_at"), METADATA_CACHE_MAX_AGE_DAYS) and is_fresh(
+        metadata.get("reviews_fetched_at"), METADATA_CACHE_MAX_AGE_DAYS
+    )
 
 
 def is_metadata_retry_due(fetch_status):
@@ -62,11 +54,11 @@ def is_metadata_retry_due(fetch_status):
         return True
 
     try:
-        retry_time = datetime.fromisoformat(next_retry_at)
+        retry_time = parse_timestamp(next_retry_at)
     except (TypeError, ValueError):
         return True
 
-    return datetime.now() >= retry_time
+    return datetime.now(timezone.utc) >= retry_time
 
 
 def _retry_time_after(seconds):
@@ -131,10 +123,13 @@ def get_game_metadata(
     appid,
     force_refresh=False,
     allow_stale_on_error=True,
+    allow_fetch=True,
 ):
     appid = int(appid)
 
     cached = get_cached_metadata(appid)
+    if not allow_fetch:
+        return cached
     fetch_status = get_metadata_fetch_status(appid)
 
     # Respect persistent retry windows. This prevents a restart or opening a
@@ -180,7 +175,10 @@ def get_game_metadata(
 
             if metadata is not None:
                 save_game_metadata(metadata)
-                clear_metadata_fetch_status(appid)
+                if metadata.get("reviews") is None:
+                    _record_temporary_failure(appid, "reviews_unavailable")
+                else:
+                    clear_metadata_fetch_status(appid)
                 return get_cached_metadata(appid)
 
             # Defensive fallback: current Steam Store code raises a specific

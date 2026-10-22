@@ -447,7 +447,7 @@ def show_game_details(game, df):
     metadata_load_failed = False
 
     try:
-        metadata = get_game_metadata(appid)
+        metadata = get_game_metadata(appid, allow_fetch=False)
     except Exception:
         metadata = None
         metadata_load_failed = True
@@ -524,7 +524,7 @@ def show_game_details(game, df):
     hltb_load_failed = False
 
     try:
-        hltb = get_hltb_metadata(appid, game_name)
+        hltb = get_hltb_metadata(appid, game_name, allow_fetch=False)
     except Exception:
         # HLTB is an optional third-party source. A temporary failure must
         # never prevent the rest of the game modal from opening.

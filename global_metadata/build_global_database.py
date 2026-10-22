@@ -281,12 +281,44 @@ def sync_catalog(
     )
 
 
+def _defer_steam_service(db_path, error):
+    """Persist service-wide backoff, leaving failed rows eligible for later."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        seconds = 900
+    elif isinstance(error, requests.RequestException) and (status is None or status >= 500):
+        seconds = 300
+    else:
+        return False
+    value = response.headers.get("Retry-After") if response is not None else None
+    if value:
+        try:
+            seconds = max(seconds, float(value))
+        except ValueError:
+            from email.utils import parsedate_to_datetime
+            try:
+                seconds = max(seconds, parsedate_to_datetime(value).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    seconds = min(seconds, 24 * 3600)
+    set_state(db_path, "steam_service_retry_after", time.time() + seconds)
+    print(f"[steam] Service failure; deferring further requests for {seconds:.0f}s.")
+    return True
+
+
 def update_steam(
     db_path,
     *,
     limit,
     pause_seconds,
 ):
+    try:
+        if time.time() < float(get_state(db_path, "steam_service_retry_after", "0")):
+            print("[steam] Service cooldown is active; preserving pending work.")
+            return
+    except (TypeError, ValueError):
+        pass
     games = steam_candidates(
         db_path,
         limit,
@@ -339,6 +371,8 @@ def update_steam(
                     f"[steam] Review error {appid} "
                     f"{name!r}: {error}"
                 )
+                if _defer_steam_service(db_path, error):
+                    return
 
         else:
             try:
@@ -386,6 +420,8 @@ def update_steam(
                             f"[steam] Review error {appid} "
                             f"{name!r}: {review_error}"
                         )
+                        if _defer_steam_service(db_path, review_error):
+                            return
 
             except Exception as error:
                 # Temporary Store failures stay dirty and are retried later.
@@ -393,6 +429,8 @@ def update_steam(
                 print(
                     f"[steam] Error {appid} {name!r}: {error}"
                 )
+                if _defer_steam_service(db_path, error):
+                    return
 
         if index % 10 == 0 or index == len(games):
             print(

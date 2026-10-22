@@ -6,6 +6,9 @@ stops automatically when there is no due work left.
 """
 
 import threading
+import sqlite3
+from app_logging import get_logger
+from sqlite_support import is_busy
 
 import requests
 
@@ -38,12 +41,15 @@ _STATUS_PRIORITY = {
     STATUS_FINISHED: 3,
 }
 
+_log = get_logger(__name__)
+_restart_requested = False
+_wake_event = threading.Event()
+IDLE_POLL_SECONDS = 30
 _state_lock = threading.Lock()
 _worker_thread = None
 _stop_event = threading.Event()
 _library_games = []
 _priority_appids = []
-_completed_library_signature = None
 
 
 def _normalise_library_games(games):
@@ -79,11 +85,6 @@ def _normalise_library_games(games):
     )
 
     return normalised
-
-
-def _library_signature(games):
-    """Stable identity for the owned library, independent of personal status."""
-    return tuple(sorted(item["appid"] for item in games))
 
 
 def _current_library_games():
@@ -165,10 +166,9 @@ def _wait(seconds):
     return _stop_event.wait(seconds)
 
 
-def _worker_loop():
-    global _worker_thread, _completed_library_signature
+def _run_worker():
 
-    print(
+    _log.info(
         "[metadata] Background refresh started "
         f"(1 game every {METADATA_BACKGROUND_PAUSE_SECONDS}s)."
     )
@@ -176,165 +176,172 @@ def _worker_loop():
     total_updated = 0
     total_deferred = 0
 
-    try:
-        while not _stop_event.is_set():
-            games = _current_library_games()
+    while not _stop_event.is_set():
+        games = _current_library_games()
 
-            if not games:
-                break
+        if not games:
+            break
 
-            priority_batch = _take_priority_batch(
-                METADATA_BACKGROUND_BATCH_SIZE
-            )
+        priority_batch = _take_priority_batch(
+            METADATA_BACKGROUND_BATCH_SIZE
+        )
 
-            if priority_batch:
-                batch = [
-                    (appid, True)
-                    for appid in priority_batch
-                ]
-            else:
-                candidates, _, _ = _candidate_appids(games)
+        if priority_batch:
+            batch = [
+                (appid, True)
+                for appid in priority_batch
+            ]
+        else:
+            candidates, _, _ = _candidate_appids(games)
 
-                if not candidates:
-                    # Remember that this exact owned-library snapshot has
-                    # already been checked. Streamlit reruns the app script
-                    # frequently; without this guard each rerun would start a
-                    # new worker only to discover the same empty queue.
-                    with _state_lock:
-                        _completed_library_signature = _library_signature(games)
+            if not candidates:
+                # Completion changes as retry deadlines and TTLs expire.
+                _wake_event.wait(IDLE_POLL_SECONDS)
+                _wake_event.clear()
+                continue
 
-                    print("[metadata] Cache is up to date for this library.")
-                    break
+            # Build a small queue to avoid rescanning the whole SQLite
+            # cache after every single game. Requests are still strictly
+            # sequential with a pause after each one; there is no burst.
+            batch = [
+                (appid, False)
+                for appid in candidates[:METADATA_BACKGROUND_BATCH_SIZE]
+            ]
 
-                # Build a small queue to avoid rescanning the whole SQLite
-                # cache after every single game. Requests are still strictly
-                # sequential with a pause after each one; there is no burst.
-                batch = [
-                    (appid, False)
-                    for appid in candidates[:METADATA_BACKGROUND_BATCH_SIZE]
-                ]
+        network_backoff = None
 
-            network_backoff = None
-
-            for index, (appid, force_refresh) in enumerate(batch):
-                if _stop_event.is_set():
-                    break
-
-                try:
-                    metadata = get_game_metadata(
-                        appid,
-                        force_refresh=force_refresh,
-                        allow_stale_on_error=False,
-                    )
-
-                    if metadata is None or not is_cache_fresh(metadata):
-                        total_deferred += 1
-                    else:
-                        total_updated += 1
-
-                except SteamStoreMetadataUnavailable:
-                    # metadata_service has already persisted the retry state
-                    # for this AppID.
-                    total_deferred += 1
-
-                except requests.HTTPError as error:
-                    total_deferred += 1
-                    status_code = getattr(
-                        getattr(error, "response", None),
-                        "status_code",
-                        None,
-                    )
-
-                    if status_code == 429:
-                        network_backoff = METADATA_RATE_LIMIT_BACKOFF_SECONDS
-                        print(
-                            "[metadata] Steam rate limit detected; "
-                            "background refresh is backing off."
-                        )
-                        break
-
-                    if status_code is not None and status_code >= 500:
-                        network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
-                        break
-
-                except requests.RequestException:
-                    total_deferred += 1
-                    network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
-                    print(
-                        "[metadata] Network problem; background refresh "
-                        "is backing off."
-                    )
-                    break
-
-                except Exception:
-                    total_deferred += 1
-
-                processed = total_updated + total_deferred
-
-                if processed % 10 == 0:
-                    _, remaining_missing, remaining_stale = _candidate_appids(
-                        _current_library_games()
-                    )
-                    print(
-                        "[metadata] Progress: "
-                        f"{total_updated} updated, {total_deferred} deferred this session; "
-                        f"{remaining_missing} missing + {remaining_stale} stale pending."
-                    )
-
-                # Smooth request rate: one game, then pause, including between
-                # items in the internal queue.
-                if index < len(batch) - 1:
-                    if _wait(METADATA_BACKGROUND_PAUSE_SECONDS):
-                        break
-
+        for index, (appid, force_refresh) in enumerate(batch):
             if _stop_event.is_set():
                 break
 
-            if network_backoff is not None:
-                if _wait(network_backoff):
+            try:
+                metadata = get_game_metadata(
+                    appid,
+                    force_refresh=force_refresh,
+                    allow_stale_on_error=False,
+                )
+
+                if metadata is None or not is_cache_fresh(metadata):
+                    total_deferred += 1
+                else:
+                    total_updated += 1
+
+            except SteamStoreMetadataUnavailable:
+                # metadata_service has already persisted the retry state
+                # for this AppID.
+                total_deferred += 1
+
+            except requests.HTTPError as error:
+                total_deferred += 1
+                status_code = getattr(
+                    getattr(error, "response", None),
+                    "status_code",
+                    None,
+                )
+
+                if status_code == 429:
+                    network_backoff = METADATA_RATE_LIMIT_BACKOFF_SECONDS
+                    _log.info(
+                        "[metadata] Steam rate limit detected; "
+                        "background refresh is backing off."
+                    )
                     break
-            else:
-                # Also pause between the last game in this queue and the first
-                # game in the next queue so the request cadence stays uniform.
+
+                if status_code is not None and status_code >= 500:
+                    network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
+                    break
+
+            except requests.RequestException:
+                total_deferred += 1
+                network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
+                _log.info(
+                    "[metadata] Network problem; background refresh "
+                    "is backing off."
+                )
+                break
+
+            except Exception:
+                _log.exception("Steam metadata request failed for %s", appid)
+                total_deferred += 1
+
+            processed = total_updated + total_deferred
+
+            if processed % 10 == 0:
+                _, remaining_missing, remaining_stale = _candidate_appids(
+                    _current_library_games()
+                )
+                _log.info(
+                    "[metadata] Progress: "
+                    f"{total_updated} updated, {total_deferred} deferred this session; "
+                    f"{remaining_missing} missing + {remaining_stale} stale pending."
+                )
+
+            # Smooth request rate: one game, then pause, including between
+            # items in the internal queue.
+            if index < len(batch) - 1:
                 if _wait(METADATA_BACKGROUND_PAUSE_SECONDS):
                     break
 
+        if _stop_event.is_set():
+            break
+
+        if network_backoff is not None:
+            if _wait(network_backoff):
+                break
+        else:
+            # Also pause between the last game in this queue and the first
+            # game in the next queue so the request cadence stays uniform.
+            if _wait(METADATA_BACKGROUND_PAUSE_SECONDS):
+                break
+
+def _worker_loop():
+    global _worker_thread, _restart_requested
+    try:
+        while not _stop_event.is_set():
+            try:
+                _run_worker()
+                break
+            except sqlite3.Error as error:
+                _log.exception("Background database scan failed")
+                if not is_busy(error) or _wait(5):
+                    break
+            except OSError:
+                _log.exception("Background filesystem operation failed")
+                if _wait(30):
+                    break
+            except Exception:
+                # Programming/schema failures remain visible in the persistent
+                # log, rather than spinning forever behind a broad retry.
+                _log.exception("Background worker failed")
+                break
     finally:
         with _state_lock:
             _worker_thread = None
+            if _restart_requested:
+                _restart_requested = False
+                _launch_worker_locked()
 
-        print("[metadata] Background refresh stopped.")
+
+def _launch_worker_locked():
+    global _worker_thread
+    _stop_event.clear()
+    _worker_thread = threading.Thread(target=_worker_loop, name="steam-metadata-refresh", daemon=True)
+    _worker_thread.start()
 
 
 def start_metadata_background_refresh(games):
-    """Start or update the single background metadata worker.
-
-    Once a library snapshot has been confirmed up to date, ordinary Streamlit
-    reruns do not start another worker for that same set of AppIDs. A changed
-    library or an explicit manual recheck can start it again.
-    """
-    global _worker_thread, _library_games, _completed_library_signature
-
+    """Update the snapshot and request running, including during shutdown."""
+    global _library_games, _restart_requested
     normalised = _normalise_library_games(games)
-    signature = _library_signature(normalised)
-
     with _state_lock:
         _library_games = normalised
-
+        _wake_event.set()
         if _worker_thread is not None and _worker_thread.is_alive():
+            if _stop_event.is_set():
+                _restart_requested = True
             return False
-
-        if signature and signature == _completed_library_signature:
-            return False
-
-        _stop_event.clear()
-        _worker_thread = threading.Thread(
-            target=_worker_loop,
-            name="steam-metadata-refresh",
-            daemon=True,
-        )
-        _worker_thread.start()
-
+        _restart_requested = False
+        _launch_worker_locked()
     return True
 
 
@@ -345,30 +352,25 @@ def request_metadata_recheck(games, appids):
     active network/rate-limit backoff. Retry windows for these AppIDs are
     bypassed only for this user-requested pass.
     """
-    global _worker_thread, _library_games, _completed_library_signature
+    global _library_games
 
     normalised = _normalise_library_games(games)
     valid_appids = {item["appid"] for item in normalised}
 
     with _state_lock:
         _library_games = normalised
-        _completed_library_signature = None
 
     queued = _queue_priority_appids(appids, valid_appids)
 
-    with _state_lock:
-        if _worker_thread is None or not _worker_thread.is_alive():
-            _stop_event.clear()
-            _worker_thread = threading.Thread(
-                target=_worker_loop,
-                name="steam-metadata-refresh",
-                daemon=True,
-            )
-            _worker_thread.start()
+    start_metadata_background_refresh(normalised)
 
     return queued
 
 
 def stop_metadata_background_refresh():
-    """Ask the worker to stop. The daemon also dies with the app process."""
-    _stop_event.set()
+    """Request stopped; a subsequent start is remembered until cleanup."""
+    global _restart_requested
+    with _state_lock:
+        _restart_requested = False
+        _stop_event.set()
+        _wake_event.set()

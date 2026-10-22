@@ -610,11 +610,13 @@ def save_steam_unavailable(db_path, appid):
 
 
 def hltb_candidates(db_path, limit):
+    from hltb_service import has_sequel_conflict
     matched_cutoff = _cutoff_iso(HLTB_CACHE_MAX_AGE_DAYS)
     no_match_cutoff = _cutoff_iso(GLOBAL_HLTB_NO_MATCH_CACHE_DAYS)
     now = _now_iso()
 
     with connect(db_path) as conn:
+        conn.create_function("sequel_conflict", 2, has_sequel_conflict)
         rows = conn.execute(
             """
             SELECT c.appid, c.name
@@ -630,6 +632,9 @@ def hltb_candidates(db_path, limit):
                 AND (
                     h.appid IS NULL
                     OR c.hltb_dirty = 1
+                    OR (h.state = 'matched'
+                        AND COALESCE(h.match_confidence, '') <> 'manual'
+                        AND sequel_conflict(h.searched_name, h.matched_name))
                     OR (
                         h.state = 'matched'
                         AND h.match_confidence <> 'manual'

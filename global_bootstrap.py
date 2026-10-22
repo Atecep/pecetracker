@@ -5,6 +5,11 @@ import hashlib
 from pathlib import Path
 import shutil
 import tempfile
+import threading
+import time
+import sqlite3
+from app_logging import get_logger
+from sqlite_support import is_busy
 from urllib.request import Request, urlopen
 
 from database import (
@@ -13,6 +18,12 @@ from database import (
     set_app_state,
 )
 
+
+_log = get_logger(__name__)
+_worker_lock = threading.Lock()
+_worker_thread = None
+_next_check = 0.0
+_last_result = None
 
 GLOBAL_BOOTSTRAP_VERSION = 1
 GLOBAL_BOOTSTRAP_STATE_KEY = (
@@ -194,30 +205,30 @@ def bootstrap_global_metadata(library_records):
     the fallback, and another bootstrap attempt is allowed after the cooldown.
     """
 
-    if global_bootstrap_completed():
-        return {
-            "attempted": False,
-            "completed": True,
-            "steam_imported": 0,
-            "hltb_imported": 0,
-            "error": None,
-        }
-
-    if not should_attempt_global_bootstrap():
-        return {
-            "attempted": False,
-            "completed": False,
-            "steam_imported": 0,
-            "hltb_imported": 0,
-            "error": None,
-        }
-
-    set_app_state(
-        GLOBAL_BOOTSTRAP_LAST_ATTEMPT_KEY,
-        _now_iso(),
-    )
-
     try:
+        if global_bootstrap_completed():
+            return {
+                "attempted": False,
+                "completed": True,
+                "steam_imported": 0,
+                "hltb_imported": 0,
+                "error": None,
+            }
+
+        if not should_attempt_global_bootstrap():
+            return {
+                "attempted": False,
+                "completed": False,
+                "steam_imported": 0,
+                "hltb_imported": 0,
+                "error": None,
+            }
+
+        set_app_state(
+            GLOBAL_BOOTSTRAP_LAST_ATTEMPT_KEY,
+            _now_iso(),
+        )
+
         with tempfile.TemporaryDirectory(
             prefix="slt-global-metadata-"
         ) as temp_dir:
@@ -284,10 +295,12 @@ def bootstrap_global_metadata(library_records):
         }
 
     except Exception as error:
-        print(
-            "[global-bootstrap] "
-            f"Bootstrap failed: {error}"
-        )
+        _log.exception("Global metadata bootstrap failed")
+        if is_busy(error):
+            try:
+                set_app_state(GLOBAL_BOOTSTRAP_LAST_ATTEMPT_KEY, "")
+            except sqlite3.Error:
+                _log.warning("Could not clear bootstrap attempt after contention")
 
         return {
             "attempted": True,
@@ -295,4 +308,33 @@ def bootstrap_global_metadata(library_records):
             "steam_imported": 0,
             "hltb_imported": 0,
             "error": str(error),
+            "retry_soon": is_busy(error),
         }
+
+
+def start_global_bootstrap(library_records):
+    """Run bootstrap off the Streamlit thread; callers only inspect snapshots."""
+    global _worker_thread, _next_check, _last_result
+    with _worker_lock:
+        if _worker_thread is not None or time.monotonic() < _next_check:
+            return
+        snapshot = [{"AppID": game["AppID"]} for game in library_records]
+        def run():
+            global _worker_thread, _next_check, _last_result
+            try:
+                result = bootstrap_global_metadata(snapshot)
+            except Exception:
+                _log.exception("Unexpected bootstrap worker failure")
+                result = {"completed": False, "attempted": True, "error": "Bootstrap failed", "retry_soon": True}
+            finally:
+                with _worker_lock:
+                    _last_result = result
+                    _next_check = time.monotonic() + (30 if result.get("retry_soon") else GLOBAL_BOOTSTRAP_RETRY_HOURS * 3600)
+                    _worker_thread = None
+        _worker_thread = threading.Thread(target=run, name="global-bootstrap", daemon=True)
+        _worker_thread.start()
+
+
+def get_bootstrap_result():
+    with _worker_lock:
+        return dict(_last_result) if _last_result is not None else None
