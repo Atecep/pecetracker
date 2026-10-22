@@ -146,9 +146,13 @@ Your local database contains personal game statuses and notes together with cach
 
 ## Backup and restore
 
-Your local library database can be exported as a backup and restored later from within the app.
+The in-app JSON backup exports the personal statuses and notes you saved. Restore merges those entries into the local database.
+
+It is not a complete database backup: settings, API keys, cached metadata and manually assigned HowLongToBeat IDs are excluded. To retain manual HLTB assignments when moving computers, close SLT normally and copy the application data directory, keeping any SQLite sidecar files together with `library.db`. Treat `config.json` and its backup as private because they contain your API key.
 
 This is useful when moving to another computer or before making changes to your local installation.
+
+Diagnostics are written to `slt.log` in the same application data directory, with size-limited rotation. Windows builds retain their normal windowed behavior. Existing configurations are replaced atomically; the previous file is retained as `config.json.bak`.
 
 ## Updates
 

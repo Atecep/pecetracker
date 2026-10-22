@@ -3,6 +3,7 @@ import sqlite3
 
 from database import save_game_status
 from app_logging import get_logger
+from constants import STATUSES
 
 
 def init_session_state():
@@ -36,6 +37,8 @@ def get_game_image(appid):
     )
 
 def save_gallery_status(appid, widget_key):
+    if st.session_state.get(widget_key) not in STATUSES:
+        return
     try:
         save_game_status(appid=appid, status=st.session_state[widget_key])
     except sqlite3.Error:

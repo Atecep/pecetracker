@@ -88,3 +88,15 @@ The desktop application's local HLTB no_match cache
 remains at 30 days.
 
 Only eligible records are refreshed during maintenance.
+
+## Measuring local ownership coverage
+
+After refreshing your account in SLT, run:
+
+```bash
+python global_metadata/check_library_coverage.py /path/to/global_metadata.db
+```
+
+Coverage uses the last successful ownership snapshot for the configured account, including games with no personal edits. Use `--steam-id STEAMID64` to select another account with a saved snapshot. Older installations need one successful library refresh to create this snapshot; the tool no longer substitutes edited-game rows as the denominator.
+
+The desktop bootstrap retains the catalogue's original fetch dates. It does not renew cache freshness when copying rows. The desktop and global matcher reject conflicting sequel numbers, while manual local HLTB IDs remain authoritative. Global Steam HTTP 429/server/network failures pause the rest of a batch and persist a service cooldown for the next run.

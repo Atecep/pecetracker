@@ -58,6 +58,17 @@ class MetadataReliabilityTests(unittest.TestCase):
         self.assertEqual(row['fetched_at'],row['reviews_fetched_at'])
         self.assertEqual(db.get_all_game_data()[1]['notes'],'keep')
 
+    def test_due_review_retry_runs_even_when_preserved_reviews_are_still_fresh(self):
+        import metadata_background
+        db.save_game_metadata({'appid':1,'reviews':{'positive_percentage':95,'total_reviews':100}})
+        db.save_metadata_fetch_status(1,'deferred',next_retry_at='2000-01-01T00:00:00',last_error='reviews_unavailable')
+        self.assertEqual(metadata_background._candidate_appids([{'appid':1}])[0],[1])
+        with patch.object(ms,'fetch_steam_metadata',return_value={'appid':1,'reviews':{'positive_percentage':96,'total_reviews':101}}) as fetch:
+            row=ms.get_game_metadata(1)
+        self.assertEqual(fetch.call_count,1)
+        self.assertEqual(row['total_reviews'],101)
+        self.assertIsNone(db.get_metadata_fetch_status(1))
+
     def test_display_reads_never_fetch_or_wait_on_fetch_locks(self):
         with patch.object(ms,'_get_fetch_lock',side_effect=AssertionError('waited')), patch.object(hs,'_get_fetch_lock',side_effect=AssertionError('waited')):
             self.assertIsNone(ms.get_game_metadata(1,allow_fetch=False))
@@ -166,3 +177,9 @@ class MetadataReliabilityTests(unittest.TestCase):
                 release.set();worker.join(3)
             self.assertEqual(run.call_count,1)
             self.assertTrue(bootstrap.get_bootstrap_result()['completed'])
+
+    def test_bootstrap_does_not_extend_an_existing_cooldown_by_another_six_hours(self):
+        with patch.object(bootstrap,'_worker_thread',None),patch.object(bootstrap,'_next_check',0),patch.object(bootstrap,'_last_result',None),patch.object(bootstrap.threading,'Thread') as thread,patch.object(bootstrap,'bootstrap_global_metadata',return_value={'attempted':False,'completed':False}),patch.object(bootstrap.time,'monotonic',return_value=100):
+            bootstrap.start_global_bootstrap([{'AppID':1}])
+            thread.call_args.kwargs['target']()
+            self.assertEqual(bootstrap._next_check,130)

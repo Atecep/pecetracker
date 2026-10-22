@@ -27,7 +27,9 @@ def _project_root() -> Path:
 PROJECT_ROOT = _project_root()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from database import get_all_game_data  # noqa: E402
+from database import get_library_appids  # noqa: E402
+from settings import load_settings, SettingsError  # noqa: E402
+from sqlite_support import ClosingConnection  # noqa: E402
 
 
 def _percentage(value: int, total: int) -> float:
@@ -55,6 +57,7 @@ def main() -> None:
         type=Path,
         help="Path to the downloaded global_metadata.db",
     )
+    parser.add_argument("--steam-id", help="Account whose last successful ownership snapshot should be measured")
     args = parser.parse_args()
 
     global_db = args.global_db.expanduser().resolve()
@@ -62,8 +65,14 @@ def main() -> None:
     if not global_db.is_file():
         raise SystemExit(f"Global database not found: {global_db}")
 
-    local_game_data = get_all_game_data()
-    appids = sorted({int(appid) for appid in local_game_data})
+    try:
+        steam_id = args.steam_id or load_settings()["steam_id"]
+    except SettingsError as error:
+        raise SystemExit(str(error)) from error
+    appids = get_library_appids(steam_id)
+
+    if appids is None:
+        raise SystemExit("No ownership snapshot is available for this account. Refresh the library in SLT first.")
 
     if not appids:
         raise SystemExit(
@@ -71,7 +80,7 @@ def main() -> None:
             "Open SLT and sync the Steam library first."
         )
 
-    with sqlite3.connect(global_db) as conn:
+    with sqlite3.connect(global_db.as_uri() + "?mode=ro", uri=True, factory=ClosingConnection) as conn:
         conn.row_factory = sqlite3.Row
 
         # A temporary table avoids SQLite's host-parameter limit for

@@ -92,6 +92,14 @@ class PersistenceTests(unittest.TestCase):
             except ValueError: pass
             with self.assertRaises(sqlite3.ProgrammingError): c.execute("SELECT 1")
 
+    def test_newer_schema_is_never_downgraded(self):
+        db.init_database();db.save_game_data(1,'playing','keep')
+        with db.get_connection() as c:c.execute(f'PRAGMA user_version={db.SCHEMA_VERSION+1}')
+        with self.assertRaises(RuntimeError):db.init_database()
+        with db.get_connection() as c:
+            self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],db.SCHEMA_VERSION+1)
+        self.assertEqual(db.get_all_game_data()[1]['notes'],'keep')
+
     def test_status_only_preserves_newer_notes(self):
         db.init_database()
         db.save_game_data(1, "backlog", "new notes from other window")

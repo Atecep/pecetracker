@@ -145,6 +145,7 @@ def get_game_metadata(
     if (
         cached is not None
         and not force_refresh
+        and fetch_status is None
         and is_cache_fresh(cached)
     ):
         return cached
@@ -166,6 +167,7 @@ def get_game_metadata(
         if (
             cached is not None
             and not force_refresh
+            and fetch_status is None
             and is_cache_fresh(cached)
         ):
             return cached

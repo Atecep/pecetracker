@@ -155,7 +155,7 @@ def _candidate_appids(games):
 
         if metadata is None:
             missing.append(appid)
-        elif not is_cache_fresh(metadata):
+        elif fetch_status is not None or not is_cache_fresh(metadata):
             stale.append(appid)
 
     return missing + stale, len(missing), len(stale)

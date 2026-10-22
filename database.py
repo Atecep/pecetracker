@@ -34,7 +34,10 @@ def init_database():
         # Serialize writers BEFORE inspecting the old schema. DDL and the
         # version marker commit together; a failed migration rolls back.
         conn.execute("BEGIN IMMEDIATE")
-        if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError("This database requires a newer SLT version.")
+        if version == SCHEMA_VERSION:
             return
 
         # User data
@@ -705,6 +708,17 @@ def set_app_state(key, value):
             """,
             (str(key), str(value)),
         )
+
+
+def save_library_appids(steam_id, games):
+    """Store ownership separately from the subset with personal edits."""
+    appids = sorted({int(game["appid"]) for game in games})
+    set_app_state(f"owned_appids:{steam_id}", json.dumps(appids))
+
+
+def get_library_appids(steam_id):
+    value = get_app_state(f"owned_appids:{steam_id}")
+    return None if value is None else [int(appid) for appid in json.loads(value)]
 
 
 def import_global_metadata(global_db_path, library_records):

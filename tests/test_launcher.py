@@ -51,6 +51,12 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): launcher.reopen_existing_instance()
             kill.assert_not_called()
 
+    def test_same_version_legacy_launcher_is_not_silently_reopened(self):
+        launcher.INSTANCE_STATE_PATH.write_text(json.dumps({'pid':12345,'port':8501,'version':launcher.APP_VERSION}))
+        with patch.object(launcher,'pid_is_running',return_value=True),patch.object(launcher,'server_is_healthy',return_value=True),patch.object(launcher.webbrowser,'open') as open_browser:
+            with self.assertRaisesRegex(RuntimeError,'legacy'):launcher.reopen_existing_instance()
+            open_browser.assert_not_called()
+
     def test_locked_file_cannot_be_reclaimed_even_during_partial_json(self):
         # A child holds the actual OS lock BEFORE writing its JSON. Parent must
         # not unlink it or acquire a second lock; works across processes on CI.

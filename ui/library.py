@@ -782,7 +782,8 @@ def render_library(df):
             .str.contains(
                 search_term,
                 case=False,
-                na=False
+                na=False,
+                regex=False,
             )
         ]
 
@@ -1331,11 +1332,8 @@ def render_library(df):
                     current_index = 0
 
                 status_key = (
-                    f"gallery_status_{appid}"
+                    f"gallery_status_{appid}_{current_index}"
                 )
-
-                if st.session_state.get(status_key) != current_status:
-                    st.session_state[status_key] = current_status
 
                 st.selectbox(
                     "Status",

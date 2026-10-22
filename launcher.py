@@ -213,8 +213,8 @@ def compare_versions(
         0  -> same version
         -1 -> existing instance is newer
 
-    Legacy instance files did not store a version. They are treated as older
-    so that the first version-aware launcher can replace them automatically.
+    Missing versions sort as older, but replacement still requires the current
+    ownership protocol and a verified process identity.
     """
     if existing_version == current_version:
         return 0
@@ -357,18 +357,19 @@ def reopen_existing_instance(
 
         if existing is not None:
             pid, port, existing_version = existing
+            state = read_json(INSTANCE_STATE_PATH) or {}
+            if state.get("protocol") != 2:
+                raise RuntimeError("A legacy SLT instance may be running. Close it manually before starting this version.")
             relation = compare_versions(
                 APP_VERSION,
                 existing_version,
             )
 
             if relation > 0:
-                state = read_json(INSTANCE_STATE_PATH) or {}
                 stop_older_instance(pid, state.get("identity"))
                 remove_stale_instance_files(pid)
                 return False
 
-            state = read_json(INSTANCE_STATE_PATH) or {}
             if state.get("protocol") == 2 and not identity_matches(pid, state.get("identity")):
                 return False
             if server_is_healthy(port):

@@ -1117,6 +1117,9 @@ def show_game_details(game, df):
             key=f"detail_save_{appid}"
         ):
 
+            if status not in STATUSES:
+                st.warning("Choose a status before saving.")
+                return
             try:
                 save_game_data(
                     appid=appid, status=status, notes=notes,
@@ -1130,16 +1133,6 @@ def show_game_details(game, df):
                 st.warning("Your changes could not be saved. Your draft is still here; please try again.")
                 return
             st.session_state[baseline_key] = {"status": status, "notes": notes}
-
-            gallery_status_key = (
-                f"gallery_status_{appid}"
-            )
-
-            if gallery_status_key in st.session_state:
-
-                st.session_state[
-                    gallery_status_key
-                ] = status
 
             # Keep the game dialog open after saving.
             # The full rerun reloads the row from SQLite, while

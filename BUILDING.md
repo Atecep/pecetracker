@@ -128,7 +128,7 @@ You can confirm the usual Streamlit ports are free with:
 ss -ltnp | grep -E ':850[1-9]'
 ```
 
-The instance state files can also be removed safely if required:
+Close all SLT processes before removing stale instance state files. The current launcher holds an operating-system lock for its lifetime; deleting `instance.lock` while it is running breaks that ownership protocol.
 
 ```bash
 rm -f ~/.local/share/SteamLibraryTracker/instance.json
@@ -136,6 +136,8 @@ rm -f ~/.local/share/SteamLibraryTracker/instance.lock
 ```
 
 Do not remove `config.json` or `library.db` unless you intentionally want to reset the application's local data.
+
+Older launchers without process-identity records must be closed manually before upgrading. The new launcher never terminates a process based only on a recorded PID.
 
 ---
 
@@ -298,3 +300,21 @@ v1.1.0
 ```
 
 The update checker compares the installed application version with the latest published GitHub Release.
+
+## Regression tests
+
+Run the offline suite using the installed build environment:
+
+```bash
+python -B tests/run_tests.py
+```
+
+The runner redirects application data/configuration paths to temporary directories before importing SLT and blocks real HTTP. Tests cover SQLite migration/rollback and concurrent writers, launcher ownership, settings recovery, workers, caches, HLTB matching, personal edits and real Streamlit widget behavior. GitHub Actions runs the same suite on Linux and Windows; a workflow definition alone is not evidence of a completed Windows run.
+
+An optional Linux rendered smoke uses an installed Chromium-family browser, a private temporary browser profile, temporary SQLite and simulated metadata:
+
+```bash
+python -B tests/linux_browser_smoke.py --browser /path/to/chromium --output /tmp/slt-browser-validation
+```
+
+It checks literal search, game details, the Linux ProtonDB dialog/back navigation and explicit note saving, and writes screenshots/logs to the output directory. It does not validate a frozen executable or live metadata services.

@@ -329,7 +329,10 @@ def start_global_bootstrap(library_records):
             finally:
                 with _worker_lock:
                     _last_result = result
-                    _next_check = time.monotonic() + (30 if result.get("retry_soon") else GLOBAL_BOOTSTRAP_RETRY_HOURS * 3600)
+                    # Persistent attempt state owns the download cooldown.
+                    # Poll it briefly instead of starting a NEW six-hour wait
+                    # when an earlier attempt's cooldown is already part-way over.
+                    _next_check = time.monotonic() + (GLOBAL_BOOTSTRAP_RETRY_HOURS * 3600 if result.get("completed") else 30)
                     _worker_thread = None
         _worker_thread = threading.Thread(target=run, name="global-bootstrap", daemon=True)
         _worker_thread.start()
