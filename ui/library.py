@@ -1334,6 +1334,9 @@ def render_library(df):
                     f"gallery_status_{appid}"
                 )
 
+                if st.session_state.get(status_key) != current_status:
+                    st.session_state[status_key] = current_status
+
                 st.selectbox(
                     "Status",
                     STATUSES,
@@ -1343,7 +1346,6 @@ def render_library(df):
                     on_change=save_gallery_status,
                     args=(
                         appid,
-                        game["Notes"],
                         status_key
                     )
                 )

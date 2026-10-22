@@ -1,109 +1,53 @@
 import json
 import os
+import tempfile
+from pathlib import Path
 
 from app_paths import CONFIG_PATH, ensure_data_dir
 
+DEFAULT_SETTINGS = {"steam_profile": "", "steam_id": "", "steam_api_key": ""}
+
+
+class SettingsError(ValueError):
+    """An existing configuration could not be read; its contents are retained."""
+
 
 def load_settings():
-
-    default_settings = {
-        "steam_profile": "",
-        "steam_id": "",
-        "steam_api_key": "",
-    }
-
-    if not CONFIG_PATH.exists():
-        return default_settings
-
     try:
-
-        with CONFIG_PATH.open(
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-    except (
-        json.JSONDecodeError,
-        OSError,
-    ):
-        return default_settings
-
-    steam_id = str(
-        data.get(
-            "steam_id",
-            ""
-        )
-    ).strip()
-
-    steam_profile = str(
-        data.get(
-            "steam_profile",
-            ""
-        )
-    ).strip()
-
-    # Compatibility with the previous version
-    if not steam_profile and steam_id:
-
-        steam_profile = (
-            "https://steamcommunity.com/"
-            f"profiles/{steam_id}/"
-        )
-
-    return {
-        "steam_profile": steam_profile,
-        "steam_id": steam_id,
-
-        "steam_api_key": str(
-            data.get(
-                "steam_api_key",
-                ""
-            )
-        ).strip(),
-    }
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Expected a settings object")
+        if any(not isinstance(data.get(key, ""), (str, int)) for key in DEFAULT_SETTINGS):
+            raise ValueError("Invalid setting type")
+    except FileNotFoundError:
+        return dict(DEFAULT_SETTINGS)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SettingsError("The saved configuration is unreadable. Reconnect your account to replace it; the original file will be backed up.") from error
+    result = {key: str(data.get(key, "")).strip() for key in DEFAULT_SETTINGS}
+    if not result["steam_profile"] and result["steam_id"]:
+        result["steam_profile"] = f"https://steamcommunity.com/profiles/{result['steam_id']}/"
+    return result
 
 
-def save_settings(
-    steam_profile,
-    steam_id,
-    steam_api_key
-):
+def _atomic_write(path, content):
+    """Create with private permissions and replace only after a complete write."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
+
+def save_settings(steam_profile, steam_id, steam_api_key):
     ensure_data_dir()
-
-    data = {
-        "steam_profile": str(
-            steam_profile
-        ).strip(),
-
-        "steam_id": str(
-            steam_id
-        ).strip(),
-
-        "steam_api_key": str(
-            steam_api_key
-        ).strip(),
-    }
-
-    with CONFIG_PATH.open(
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            data,
-            file,
-            indent=4
-        )
-
-    try:
-
-        os.chmod(
-            CONFIG_PATH,
-            0o600
-        )
-
-    except OSError:
-        pass
+    data = dict(zip(DEFAULT_SETTINGS, (steam_profile, steam_id, steam_api_key)))
+    payload = json.dumps({key: str(value).strip() for key, value in data.items()}, indent=4).encode("utf-8")
+    if CONFIG_PATH.exists():
+        _atomic_write(CONFIG_PATH.with_suffix(".json.bak"), CONFIG_PATH.read_bytes())
+    _atomic_write(CONFIG_PATH, payload)

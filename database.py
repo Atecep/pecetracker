@@ -3,19 +3,39 @@ import json
 
 from datetime import datetime
 from app_paths import DATABASE_PATH, ensure_data_dir
+from sqlite_support import ClosingConnection
+
+SCHEMA_VERSION = 1
+CONNECTION_TIMEOUT = 5.0
+_UNSET = object()
+
+
+class GameDataConflict(RuntimeError):
+    """A full edit was based on personal data that has since changed."""
 
 
 def get_connection():
     ensure_data_dir()
 
     return sqlite3.connect(
-        DATABASE_PATH
+        DATABASE_PATH, timeout=CONNECTION_TIMEOUT, factory=ClosingConnection
     )
 
 
 def init_database():
 
     with get_connection() as conn:
+
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError("This database requires a newer SLT version.")
+        if version == SCHEMA_VERSION:
+            return
+        # Serialize writers BEFORE inspecting the old schema. DDL and the
+        # version marker commit together; a failed migration rolls back.
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+            return
 
         # User data
         conn.execute("""
@@ -110,8 +130,10 @@ def init_database():
             UPDATE metadata_fetch_status
             SET state = 'metadata_unavailable'
             WHERE state = 'possibly_delisted'
-               OR last_error = 'store_unavailable'
+               OR (last_error = 'store_unavailable'
+                   AND state <> 'metadata_unavailable')
         """)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 def get_all_game_data():
 
@@ -140,10 +162,24 @@ def get_all_game_data():
 def save_game_data(
     appid,
     status,
-    notes=""
+    notes="",
+    expected=_UNSET,
 ):
 
     with get_connection() as conn:
+
+        if expected is not _UNSET:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status, notes FROM game_data WHERE appid = ?", (int(appid),)
+            ).fetchone()
+            baseline = None if expected is None else (
+                expected["status"], expected.get("notes") or ""
+            )
+            if current is not None:
+                current = (current[0], current[1] or "")
+            if current != baseline:
+                raise GameDataConflict("This game was changed in another window.")
 
         conn.execute("""
             INSERT INTO game_data (
@@ -164,6 +200,15 @@ def save_game_data(
             status,
             notes
         ))
+
+
+def save_game_status(appid, status):
+    """A gallery action changes only status, never a captured copy of notes."""
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO game_data(appid, status, notes) VALUES (?, ?, '')
+            ON CONFLICT(appid) DO UPDATE SET status = excluded.status
+        """, (int(appid), status))
 
 
 def import_game_data(games):

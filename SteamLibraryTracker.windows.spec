@@ -15,6 +15,7 @@ altair_hiddenimports = collect_submodules("altair")
 altair_metadata = copy_metadata("altair")
 
 project_hiddenimports = [
+    "app_logging",
     "app_paths",
     "constants",
     "database",

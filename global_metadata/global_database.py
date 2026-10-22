@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from sqlite_support import ClosingConnection
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,7 +47,7 @@ def connect(db_path):
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 10000")

@@ -1,6 +1,8 @@
 import streamlit as st
+import sqlite3
 
-from database import save_game_data
+from database import save_game_status
+from app_logging import get_logger
 
 
 def init_session_state():
@@ -33,12 +35,12 @@ def get_game_image(appid):
         f"store_item_assets/steam/apps/{appid}/header.jpg"
     )
 
-def save_gallery_status(appid, notes, widget_key):
-    save_game_data(
-        appid=appid,
-        status=st.session_state[widget_key],
-        notes=notes
-    )
+def save_gallery_status(appid, widget_key):
+    try:
+        save_game_status(appid=appid, status=st.session_state[widget_key])
+    except sqlite3.Error:
+        get_logger(__name__).exception("Could not save gallery status for %s", appid)
+        st.warning("The status could not be saved. Please try again.")
 
 def shorten_game_title(title, max_length=42):
     title = str(title)
@@ -49,11 +51,14 @@ def shorten_game_title(title, max_length=42):
     return title[:max_length - 1].rstrip() + "…"
 
 def open_game_dialog(appid, source="library"):
+    st.session_state.pop(f"detail_baseline_{appid}", None)
     st.session_state.selected_game_appid = int(appid)
     st.session_state.open_game_dialog = True
     st.session_state.game_dialog_source = source
 
 def clear_selected_game():
+    appid = st.session_state.get("selected_game_appid")
+    st.session_state.pop(f"detail_baseline_{appid}", None)
     st.session_state.open_game_dialog = False
     st.session_state.selected_game_appid = None
     st.session_state.game_dialog_source = None

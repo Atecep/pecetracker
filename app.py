@@ -1,5 +1,9 @@
 import pandas as pd
 import streamlit as st
+import sqlite3
+
+from app_logging import configure_logging, get_logger
+from sqlite_support import is_busy
 
 from constants import (
     STATUS_BACKLOG,
@@ -13,7 +17,7 @@ from global_bootstrap import (
     bootstrap_global_metadata,
     should_attempt_global_bootstrap,
 )
-from settings import load_settings
+from settings import DEFAULT_SETTINGS, SettingsError, load_settings
 from metadata_background import (
     start_metadata_background_refresh,
     stop_metadata_background_refresh,
@@ -71,7 +75,14 @@ def get_update_info():
 # DATABASE + SESSION STATE
 # =========================================================
 
-init_database()
+configure_logging()
+try:
+    init_database()
+except (sqlite3.Error, RuntimeError) as error:
+    get_logger(__name__).exception("Database initialization failed")
+    st.error("The local database is busy. Please try again in a moment." if is_busy(error)
+             else "The local database could not be opened or upgraded. Your data has been retained. See slt.log for details.")
+    st.stop()
 init_session_state()
 
 
@@ -79,7 +90,11 @@ init_session_state()
 # STEAM CONFIGURATION
 # =========================================================
 
-settings = load_settings()
+try:
+    settings = load_settings()
+except SettingsError as error:
+    st.warning(str(error))
+    settings = dict(DEFAULT_SETTINGS)
 
 steam_profile = settings["steam_profile"]
 steam_id = settings["steam_id"]
@@ -416,6 +431,7 @@ for game in games:
             ),
             "Status": status,
             "Notes": notes,
+            "_saved_data": game_saved_data or None,
         }
     )
 

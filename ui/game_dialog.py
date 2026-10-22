@@ -1,5 +1,7 @@
 import math
 import platform
+import sqlite3
+from app_logging import get_logger
 
 import streamlit as st
 
@@ -8,6 +10,7 @@ from constants import (
     STATUSES,
 )
 from database import (
+    GameDataConflict,
     get_metadata_fetch_status,
     save_game_data,
 )
@@ -342,6 +345,11 @@ def show_game_details(game, df):
     hours = float(game["Hours"])
     current_status = game["Status"]
     current_notes = game["Notes"]
+    baseline_key = f"detail_baseline_{appid}"
+    if baseline_key not in st.session_state:
+        st.session_state[baseline_key] = game.get(
+            "_saved_data", {"status": current_status, "notes": current_notes}
+        )
 
     st.markdown(
         """
@@ -1109,11 +1117,19 @@ def show_game_details(game, df):
             key=f"detail_save_{appid}"
         ):
 
-            save_game_data(
-                appid=appid,
-                status=status,
-                notes=notes
-            )
+            try:
+                save_game_data(
+                    appid=appid, status=status, notes=notes,
+                    expected=st.session_state[baseline_key],
+                )
+            except GameDataConflict:
+                st.warning("Another window changed this game. Your draft is still here. Close and reopen the game to load the latest saved data before saving again.")
+                return
+            except sqlite3.Error:
+                get_logger(__name__).exception("Could not save personal data for %s", appid)
+                st.warning("Your changes could not be saved. Your draft is still here; please try again.")
+                return
+            st.session_state[baseline_key] = {"status": status, "notes": notes}
 
             gallery_status_key = (
                 f"gallery_status_{appid}"

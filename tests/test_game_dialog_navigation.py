@@ -174,7 +174,7 @@ class GameDialogStreamlitTests(unittest.TestCase):
                 }
             return {"summary": None}
 
-        def save(appid, status, notes):
+        def save(appid, status, notes, expected=None):
             st.session_state.save_calls.append((appid, status, notes))
             st.session_state.saved_games[appid].update(Status=status, Notes=notes)
 
