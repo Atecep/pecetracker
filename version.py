@@ -5,7 +5,7 @@ Changing the product name must never change the personal data/instance paths.
 APP_NAME = "Pecetracker"
 APP_TAGLINE = "Your Steam Library, Tamed."
 APP_DESCRIPTION = "A Steam library and backlog manager."
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 GITHUB_REPOSITORY = "Atecep/pecetracker"
 GITHUB_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
