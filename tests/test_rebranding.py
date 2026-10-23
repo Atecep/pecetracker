@@ -30,11 +30,10 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(version.APP_NAME, 'Pecetracker')
         self.assertEqual(version.APP_TAGLINE, 'Your Steam Library, Tamed.')
         self.assertEqual(version.APP_DESCRIPTION, 'A Steam library and backlog manager.')
-        self.assertEqual(version.APP_VERSION, '1.5.0')
         self.assertEqual(version.GITHUB_URL, 'https://github.com/Atecep/pecetracker')
-        self.assertEqual(version.distribution_archive_name('Linux','x86_64'), 'Pecetracker-v1.5.0-linux-x86_64.tar.xz')
-        self.assertEqual(version.distribution_archive_name('Windows','AMD64'), 'Pecetracker-v1.5.0-windows-x86_64.zip')
-        self.assertEqual(version.distribution_archive_name('Windows','ARM64'), 'Pecetracker-v1.5.0-windows-aarch64.zip')
+        self.assertEqual(version.distribution_archive_name('Linux','x86_64'), f'Pecetracker-v{version.APP_VERSION}-linux-x86_64.tar.xz')
+        self.assertEqual(version.distribution_archive_name('Windows','AMD64'), f'Pecetracker-v{version.APP_VERSION}-windows-x86_64.zip')
+        self.assertEqual(version.distribution_archive_name('Windows','ARM64'), f'Pecetracker-v{version.APP_VERSION}-windows-aarch64.zip')
 
     def test_legacy_paths_are_defaults_with_and_without_platform_environment(self):
         with tempfile.TemporaryDirectory() as scratch, patch.object(Path,'home',return_value=Path(scratch)):
@@ -51,9 +50,9 @@ class IdentityTests(unittest.TestCase):
                     self.assertFalse(expected.exists())
 
     def test_network_identity_has_new_name_and_canonical_urls(self):
-        self.assertEqual(steam_store.HEADERS['User-Agent'],'Pecetracker/1.5.0')
+        self.assertEqual(steam_store.HEADERS['User-Agent'],f'Pecetracker/{version.APP_VERSION}')
         self.assertEqual(protondb_service._request_headers()['User-Agent'],
-                         'Pecetracker/1.5.0 (+https://github.com/Atecep/pecetracker)')
+                         f'Pecetracker/{version.APP_VERSION} (+https://github.com/Atecep/pecetracker)')
         self.assertEqual(bootstrap.GLOBAL_DB_ZST_URL,
                          'https://github.com/Atecep/pecetracker/releases/download/global-db/global_metadata.db.zst')
         self.assertEqual(bootstrap.GLOBAL_DB_ZST_SHA256_URL, bootstrap.GLOBAL_DB_ZST_URL+'.sha256')
@@ -85,22 +84,23 @@ class IdentityTests(unittest.TestCase):
 
 class UpdateCompatibilityTests(unittest.TestCase):
     def test_new_release_url_and_same_version_semantics(self):
-        for tag,expected in (('v1.6.0',True),('v1.5.0',False),('global-db',False)):
+        for tag,expected in (('v1.7.0',True),(f'v{version.APP_VERSION}',False),('v1.5.0',False),('global-db',False)):
             payload={'tag_name':tag,'html_url':version.GITHUB_RELEASES_URL+'/tag/'+tag}
             with self.subTest(tag=tag), patch.object(update_checker,'urlopen',return_value=io.BytesIO(json.dumps(payload).encode())) as fetch:
                 result=update_checker.check_for_updates()
             request=fetch.call_args.args[0]
             self.assertEqual(request.full_url,'https://api.github.com/repos/Atecep/pecetracker/releases/latest')
-            self.assertEqual(request.get_header('User-agent'),'Pecetracker/1.5.0')
+            self.assertEqual(request.get_header('User-agent'),f'Pecetracker/{version.APP_VERSION}')
             self.assertEqual(result is not None,expected)
             if expected:self.assertEqual(result.release_url,payload['html_url'])
 
     def test_legacy_repository_override_can_receive_canonical_redirected_payload(self):
-        payload={'tag_name':'v1.6.0','html_url':version.GITHUB_RELEASES_URL+'/tag/v1.6.0'}
+        payload={'tag_name':'v1.7.0','html_url':version.GITHUB_RELEASES_URL+'/tag/v1.7.0'}
         with patch.object(update_checker,'urlopen',return_value=io.BytesIO(json.dumps(payload).encode())) as fetch:
-            result=update_checker.check_for_updates(repository='Atecep/steam-library-tracker')
+            result=update_checker.check_for_updates(repository='Atecep/steam-library-tracker',current_version='1.5.0')
         self.assertIn('/Atecep/steam-library-tracker/',fetch.call_args.args[0].full_url)
-        self.assertEqual(result.latest_version,'1.6.0')
+        self.assertEqual(result.current_version,'1.5.0')
+        self.assertEqual(result.latest_version,'1.7.0')
         self.assertEqual(result.release_url,payload['html_url'])
 
     def test_existing_branded_instance_is_reopened_by_identity_without_renaming_state(self):
@@ -109,7 +109,8 @@ class UpdateCompatibilityTests(unittest.TestCase):
             state=Path(scratch)/'instance.json'
             payload=json.dumps({'pid':12345,'port':8501,'version':'1.5.0','protocol':2,'identity':identity,'instance_token':'unchanged'})
             state.write_text(payload)
-            with patch.object(launcher,'INSTANCE_STATE_PATH',state), patch.object(launcher,'pid_is_running',return_value=True), patch.object(launcher,'process_identity',return_value=identity), patch.object(launcher,'server_is_healthy',return_value=True), patch.object(launcher.webbrowser,'open') as open_browser, patch.object(launcher,'terminate_process') as stop:
+            # Both launchers intentionally represent the legacy 1.5.0 build.
+            with patch.object(launcher,'APP_VERSION','1.5.0'), patch.object(launcher,'INSTANCE_STATE_PATH',state), patch.object(launcher,'pid_is_running',return_value=True), patch.object(launcher,'process_identity',return_value=identity), patch.object(launcher,'server_is_healthy',return_value=True), patch.object(launcher.webbrowser,'open') as open_browser, patch.object(launcher,'terminate_process') as stop:
                 self.assertTrue(launcher.reopen_existing_instance())
             stop.assert_not_called();open_browser.assert_called_once_with('http://localhost:8501')
             self.assertEqual(state.read_text(),payload)
@@ -147,7 +148,7 @@ print(json.dumps([str(app_paths.DATA_DIR),database.get_all_game_data()[620]['not
             bootstrap._download(bootstrap.GLOBAL_DB_ZST_URL,target)
         request=get.call_args.args[0]
         self.assertEqual(request.full_url,bootstrap.GLOBAL_DB_ZST_URL)
-        self.assertTrue(request.get_header('User-agent').startswith('Pecetracker/1.5.0'))
+        self.assertTrue(request.get_header('User-agent').startswith(f'Pecetracker/{version.APP_VERSION}'))
         self.assertEqual(target.read_bytes(),b'fixture compressed bytes')
 
     def test_bootstrap_new_repository_imports_only_missing_rows_and_preserves_manual_id(self):
