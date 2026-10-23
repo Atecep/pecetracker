@@ -35,7 +35,7 @@ from ui.common import init_session_state
 from ui.game_dialog import show_selected_game_dialog
 from ui.library import render_library
 from update_checker import check_for_updates
-from version import APP_VERSION
+from version import APP_NAME, APP_VERSION, APP_TAGLINE, APP_DESCRIPTION, GITHUB_URL
 
 
 # =========================================================
@@ -43,9 +43,10 @@ from version import APP_VERSION
 # =========================================================
 
 st.set_page_config(
-    page_title="Steam Library Tracker",
+    page_title=APP_NAME,
     page_icon="🎮",
-    layout="wide"
+    layout="wide",
+    menu_items={"About": f"{APP_NAME}\n\n{APP_TAGLINE}\n\n{APP_DESCRIPTION}\n\n{GITHUB_URL}"},
 )
 
 st.markdown(
@@ -197,7 +198,7 @@ with header_col1:
     st.markdown(
         f"""
         <h1 style="margin: 0;">
-            🎮 Steam Library Tracker
+            🎮 {APP_NAME}
             <span style="font-size: 0.42em; font-weight: 400; opacity: 0.55; white-space: nowrap;">
                 v{APP_VERSION}
             </span>
@@ -205,6 +206,7 @@ with header_col1:
         """,
         unsafe_allow_html=True
     )
+    st.caption(APP_TAGLINE)
 
 with header_col2:
     action_col, avatar_col = st.columns(
@@ -250,7 +252,7 @@ update_info = get_update_info()
 if update_info is not None:
     st.info(
         "⬆️ "
-        f"Steam Library Tracker {update_info.latest_version} is available. "
+        f"{APP_NAME} {update_info.latest_version} is available. "
         f"[View release]({update_info.release_url})"
     )
 

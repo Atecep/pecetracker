@@ -19,7 +19,7 @@ def _project_root() -> Path:
         return parent
 
     raise SystemExit(
-        "Could not find the Steam Library Tracker project root. "
+        "Could not find the Pecetracker project root. "
         "Place this script in the repository root or in global_metadata/."
     )
 
@@ -49,7 +49,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Measure how much of the local Steam library is already covered "
-            "by the SLT global metadata database."
+            "by the Pecetracker global metadata database."
         )
     )
     parser.add_argument(
@@ -72,12 +72,12 @@ def main() -> None:
     appids = get_library_appids(steam_id)
 
     if appids is None:
-        raise SystemExit("No ownership snapshot is available for this account. Refresh the library in SLT first.")
+        raise SystemExit("No ownership snapshot is available for this account. Refresh the library in Pecetracker first.")
 
     if not appids:
         raise SystemExit(
             "The local library database contains no games. "
-            "Open SLT and sync the Steam library first."
+            "Open Pecetracker and sync the Steam library first."
         )
 
     with sqlite3.connect(global_db.as_uri() + "?mode=ro", uri=True, factory=ClosingConnection) as conn:

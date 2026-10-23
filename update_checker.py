@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY
+from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY, GITHUB_API_BASE
 
 
 _VERSION_PATTERN = re.compile(
@@ -57,8 +57,7 @@ def check_for_updates(
         return None
 
     api_url = (
-        "https://api.github.com/repos/"
-        f"{repository}/releases/latest"
+        f"{GITHUB_API_BASE}/{repository}/releases/latest"
     )
 
     request = Request(

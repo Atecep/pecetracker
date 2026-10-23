@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from version import APP_VERSION
+from version import USER_AGENT, GITHUB_URL
 
 
 PROTONDB_BASE_URL = "https://www.protondb.com"
@@ -1237,8 +1237,7 @@ def _read_text_file(path: str) -> str | None:
 def _request_headers() -> dict[str, str]:
     return {
         "User-Agent": (
-            f"SteamLibraryTracker/{APP_VERSION} "
-            "(+https://github.com/Atecep/steam-library-tracker)"
+            f"{USER_AGENT} (+{GITHUB_URL})"
         ),
         "Accept": "application/json",
     }

@@ -17,6 +17,8 @@ import time
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from version import APP_NAME, APP_TAGLINE
 
 
 def free_port():
@@ -70,6 +72,8 @@ async def exercise(ws, url, output):
         await browser.call('Network.enable')
         await browser.call('Network.setBlockedURLs', urls=['*steamstatic.com*', '*github.com*', '*steampowered.com*', '*howlongtobeat.com*', '*protondb.com*'])
         await browser.call('Page.navigate', url=url)
+        await browser.wait('document.title === ' + json.dumps(APP_NAME))
+        await browser.wait('document.body.innerText.includes(' + json.dumps(APP_TAGLINE) + ')')
         await browser.wait("document.body.innerText.includes('2 games in your library')")
         await browser.wait("Boolean(document.querySelector('[data-testid=stTextInput] input'))")
         await asyncio.sleep(.5)
@@ -80,7 +84,7 @@ async def exercise(ws, url, output):
         await browser.call('Input.dispatchKeyEvent', type='keyUp', key='Enter', code='Enter', windowsVirtualKeyCode=13)
         await browser.wait("document.body.innerText.includes('1 games found')")
         await browser.screenshot(output / 'literal-search.png')
-        await browser.click('Open Fixture [Edition]')
+        await browser.click('Open Portal 2 [Edition]')
         await browser.wait("Boolean(document.querySelector('[data-testid=stDialog] textarea'))")
         await browser.evaluate("document.querySelector('[data-testid=stDialog] textarea').focus(); document.querySelector('[data-testid=stDialog] textarea').select()")
         await browser.call('Input.insertText', text='Linux browser smoke draft')
@@ -97,6 +101,12 @@ async def exercise(ws, url, output):
         await browser.screenshot(output / 'saved-details.png')
         if await browser.evaluate("Boolean(document.querySelector('[data-testid=stException]'))"):
             raise RuntimeError('Streamlit exception visible in browser')
+        await browser.call('Page.navigate', url=url)
+        await browser.wait("document.body.innerText.includes('2 games in your library')")
+        await browser.click('What should I play next?')
+        await browser.wait("Boolean(document.querySelector('[data-testid=stDialog]'))")
+        await asyncio.sleep(.5)
+        await browser.screenshot(output / 'smart-picker.png')
 
 
 def main():
@@ -123,8 +133,8 @@ if not database.get_all_game_data():
  database.save_hltb_metadata(620, 'Fixture', 'matched', hltb_id=42, matched_name='Fixture', match_confidence='manual', main_story=10)
  database.save_game_metadata({'appid':620,'genres':['Action'],'categories':['Single-player'],'reviews':{'positive_percentage':95,'total_reviews':100}})
 settings.load_settings = lambda: {'steam_profile':'fixture','steam_id':'123','steam_api_key':'fixture'}
-steam_cache.load_games = lambda *a: [{'appid':620,'name':'Fixture [Edition]','playtime_forever':60},{'appid':621,'name':'Other fixture','playtime_forever':0}]
-steam_cache.load_player_summary = lambda *a: {'personaname':'Fixture'}
+steam_cache.load_games = lambda *a: [{'appid':620,'name':'Portal 2 [Edition]','playtime_forever':60},{'appid':621,'name':'Half-Life 2','playtime_forever':0}]
+steam_cache.load_player_summary = lambda *a: {'personaname':'Demo library'}
 update_checker.check_for_updates = lambda: None
 global_bootstrap.start_global_bootstrap = lambda *a: None
 global_bootstrap.get_bootstrap_result = lambda: None
@@ -132,7 +142,10 @@ metadata_background.start_metadata_background_refresh = lambda *a: None
 hltb_background.start_hltb_background_refresh = lambda *a: None
 protondb_service.analyse_protondb = lambda *a: {'summary':None}
 from urllib.parse import quote
-common.get_game_image = lambda appid: 'data:image/svg+xml,' + quote('<svg xmlns="http://www.w3.org/2000/svg" width="460" height="215"><rect width="460" height="215" fill="slateblue"/></svg>')
+def demo_cover(appid):
+ title, color = ('Portal 2', '#237293') if appid == 620 else ('Half-Life 2', '#9d521f')
+ return 'data:image/svg+xml,' + quote('<svg xmlns="http://www.w3.org/2000/svg" width="460" height="215"><rect width="460" height="215" fill="'+color+'"/><text x="28" y="116" fill="white" font-size="40" font-family="sans-serif">'+title+'</text><text x="28" y="154" fill="white" font-size="14" font-family="sans-serif">DEMO LIBRARY</text></svg>')
+common.get_game_image = demo_cover
 runpy.run_path(%r, run_name='__main__')
 ''' % (str(ROOT), str(ROOT / 'app.py')))
         port = free_port(); url = f'http://127.0.0.1:{port}'

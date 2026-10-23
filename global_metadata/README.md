@@ -1,6 +1,6 @@
 # Global Metadata Builder
 
-This directory contains the standalone builder for the Steam Library Tracker
+This directory contains the standalone builder for the Pecetracker
 global metadata catalogue.
 
 It does **not** modify the desktop application's local database.
@@ -115,7 +115,7 @@ validated first-page summary updates reviews; an HTTP 200 with an empty
 
 Before resuming scheduled publication:
 
-1. Push the migration commit, open **Actions → Update Global Metadata → Run
+1. Push the migration commit, open **Actions → Update Pecetracker Global Metadata → Run
    workflow**, and select the branch containing it. Rerunning old run #231
    would still use its old commit.
 2. Set `steam_limit=3`, `hltb_limit=0`, `validation_only=true`. This downloads and
@@ -138,7 +138,7 @@ does not fail the run. Publication failure recovery remains unchanged.
 
 ## Measuring local ownership coverage
 
-After refreshing your account in SLT, run:
+After refreshing your account in Pecetracker, run:
 
 ```bash
 python global_metadata/check_library_coverage.py /path/to/global_metadata.db

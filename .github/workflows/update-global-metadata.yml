@@ -1,4 +1,4 @@
-name: Update Global Metadata
+name: Update Pecetracker Global Metadata
 
 on:
   workflow_dispatch:

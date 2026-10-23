@@ -1,5 +1,6 @@
 import requests
 from steam_reviews import get_review_summary
+from version import USER_AGENT
 
 
 APP_DETAILS_URL = (
@@ -7,7 +8,7 @@ APP_DETAILS_URL = (
 )
 
 HEADERS = {
-    "User-Agent": "SteamLibraryTracker/0.1"
+    "User-Agent": USER_AGENT
 }
 
 REGIONAL_FALLBACK_COUNTRY = "us"

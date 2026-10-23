@@ -473,7 +473,7 @@ def print_stats(db_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Build/update the Steam Library Tracker "
+            "Build/update the Pecetracker "
             "global Steam + HLTB metadata database."
         )
     )

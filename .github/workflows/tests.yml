@@ -1,4 +1,4 @@
-name: Regression tests
+name: Pecetracker Regression Tests
 
 on:
   push:

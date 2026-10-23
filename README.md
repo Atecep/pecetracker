@@ -1,10 +1,16 @@
-# Steam Library Tracker
+# Pecetracker
 
-A lightweight desktop app for organising, tracking and exploring your Steam library.
+**Your Steam Library, Tamed.**
 
-Steam Library Tracker runs locally on your computer and uses the Steam Web API to load your games and playtime. Personal statuses, notes and cached metadata are stored locally.
+A Steam library and backlog manager.
+
+[Repository](https://github.com/Atecep/pecetracker) · [Releases](https://github.com/Atecep/pecetracker/releases)
+
+Pecetracker runs locally on your computer and uses the Steam Web API to load your games and playtime. Personal statuses, notes and cached metadata are stored locally.
 
 ![Library](docs/screenshots/library.png)
+
+Screenshots show a demo library with illustrative covers; no personal data is used.
 
 ## Features
 
@@ -29,7 +35,7 @@ Steam Library Tracker runs locally on your computer and uses the Steam Web API t
   - Filter by genre and game mode
   - Filter by Steam review score
   - Filter by HowLongToBeat duration
-- Use **SLT Review Score**, based on Steam review data, for more useful review-based sorting
+- Use **Pecetracker Review Score**, based on Steam review data, for more useful review-based sorting
 - Refresh Steam and HowLongToBeat metadata in the background
 - Quickly inspect games without Steam or HowLongToBeat metadata
 - Export and restore your local library backup
@@ -40,7 +46,10 @@ Steam Library Tracker runs locally on your computer and uses the Steam Web API t
 
 ## Download
 
-Pre-built versions are distributed through the GitHub **Releases** page.
+Pre-built versions are distributed through [GitHub Releases](https://github.com/Atecep/pecetracker/releases).
+The names below describe new Pecetracker builds. Historical releases retain their
+original SteamLibraryTracker archive/executable names. The rebranding keeps
+version 1.5.0 during validation; a 1.6.0 release has not been prepared or published.
 
 ### Windows
 
@@ -49,7 +58,7 @@ Pre-built versions are distributed through the GitHub **Releases** page.
 3. Run:
 
 ```text
-SteamLibraryTracker.exe
+Pecetracker.exe
 ```
 
 No Python installation is required.
@@ -60,34 +69,35 @@ No Python installation is required.
 2. Extract it:
 
 ```bash
-tar -xf SteamLibraryTracker-v1.3.0-linux-x86_64.tar.xz
+tar -xf Pecetracker-v1.5.0-linux-x86_64.tar.xz
+cd Pecetracker
 ```
 
 3. Enter the extracted directory and run:
 
 ```bash
-./SteamLibraryTracker
+./Pecetracker
 ```
 
 If execution permission is missing:
 
 ```bash
-chmod +x SteamLibraryTracker
-./SteamLibraryTracker
+chmod +x Pecetracker
+./Pecetracker
 ```
 
 No Python installation is required.
 
 ## First launch
 
-On first launch, Steam Library Tracker asks for the information required to access your Steam library.
+On first launch, Pecetracker asks for the information required to access your Steam library.
 
 You will need:
 
 - a Steam Web API key
 - your SteamID64
 
-After your library is loaded, Steam Library Tracker uses its global metadata catalogue to populate available Steam Store and HowLongToBeat metadata for your games. Any missing or outdated metadata can then continue to update in the background.
+After your library is loaded, Pecetracker uses its global metadata catalogue to populate available Steam Store and HowLongToBeat metadata for your games. Any missing or outdated metadata can then continue to update in the background.
 
 ## Smart Pick
 
@@ -101,7 +111,7 @@ You can reroll a suggestion while keeping the same filters.
 
 ## HowLongToBeat
 
-Steam Library Tracker can match games in your Steam library with HowLongToBeat and cache available completion-time estimates locally.
+Pecetracker can match games in your Steam library with HowLongToBeat and cache available completion-time estimates locally.
 
 Automatic matching is intentionally conservative to reduce incorrect matches. If no reliable match is found, you can enter the game's HowLongToBeat ID manually from the game details window.
 
@@ -115,13 +125,18 @@ ProtonDB analysis is available exclusively on Linux and runs entirely on demand.
 
 Launch options from successful community reports are ranked by frequency, with more weight given to recent reports. Where possible, the analysis considers AMD and NVIDIA hardware differences to filter out options intended for a different GPU.
 
-Commands are displayed for reference only. Steam Library Tracker never applies or executes them automatically.
+Commands are displayed for reference only. Pecetracker never applies or executes them automatically.
 
 Click **← Back** to return to the game's details.
 
 ## Local data
 
-Steam Library Tracker stores user data outside the application folder so updates do not overwrite your settings, statuses or notes.
+Pecetracker stores user data outside the application folder so updates do not overwrite your settings, statuses or notes.
+
+Pecetracker is the new name of Steam Library Tracker. The historical data folder
+name is intentionally retained on both platforms, for existing and new users.
+No data is moved, copied, renamed or reset during this change. Keep using the
+same folder for SQLite, settings, logs and instance state.
 
 ### Linux
 
@@ -148,7 +163,7 @@ Your local database contains personal game statuses and notes together with cach
 
 The in-app JSON backup exports the personal statuses and notes you saved. Restore merges those entries into the local database.
 
-It is not a complete database backup: settings, API keys, cached metadata and manually assigned HowLongToBeat IDs are excluded. To retain manual HLTB assignments when moving computers, close SLT normally and copy the application data directory, keeping any SQLite sidecar files together with `library.db`. Treat `config.json` and its backup as private because they contain your API key.
+It is not a complete database backup: settings, API keys, cached metadata and manually assigned HowLongToBeat IDs are excluded. To retain manual HLTB assignments when moving computers, close Pecetracker normally and copy the application data directory, keeping any SQLite sidecar files together with `library.db`. Treat `config.json` and its backup as private because they contain your API key.
 
 This is useful when moving to another computer or before making changes to your local installation.
 
@@ -156,13 +171,18 @@ Diagnostics are written to `slt.log` in the same application data directory, wit
 
 ## Updates
 
-Steam Library Tracker can check GitHub Releases for newer versions.
+Pecetracker can check GitHub Releases for newer versions.
+
+Updates and the global metadata bootstrap use `Atecep/pecetracker`. Older builds
+still use the former GitHub URL and depend on GitHub's repository-rename redirects;
+do not recreate a repository at the old address. The `global-db` release, existing
+tags and `global_metadata.db*` assets retain their names.
 
 When a newer version is available, the app displays an update notification with a link to the corresponding release.
 
 ## Privacy
 
-Steam Library Tracker is a local desktop application.
+Pecetracker is a local desktop application.
 
 Personal notes, statuses, configuration and cached library data remain on your computer unless you explicitly export or share them.
 
@@ -170,10 +190,10 @@ Network requests are used only to retrieve the Steam library, application metada
 
 ## Development
 
-For instructions on running or building Steam Library Tracker from source, see [BUILDING.md](BUILDING.md).
+For instructions on running or building Pecetracker from source, see [BUILDING.md](BUILDING.md).
 
 ## Disclaimer
 
-Steam Library Tracker is an independent project and is not affiliated with or endorsed by Valve Corporation or HowLongToBeat.
+Pecetracker is an independent project and is not affiliated with or endorsed by Valve Corporation or HowLongToBeat.
 
 Steam and the Steam logo are trademarks and/or registered trademarks of Valve Corporation.

@@ -11,6 +11,7 @@ import sqlite3
 from app_logging import get_logger
 from sqlite_support import is_busy
 from urllib.request import Request, urlopen
+from version import GITHUB_RELEASES_URL, GLOBAL_RELEASE_TAG, USER_AGENT
 
 from database import (
     get_app_state,
@@ -34,10 +35,7 @@ GLOBAL_BOOTSTRAP_LAST_ATTEMPT_KEY = (
 )
 GLOBAL_BOOTSTRAP_RETRY_HOURS = 6
 
-GLOBAL_RELEASE_BASE_URL = (
-    "https://github.com/Atecep/steam-library-tracker/"
-    "releases/download/global-db"
-)
+GLOBAL_RELEASE_BASE_URL = f"{GITHUB_RELEASES_URL}/download/{GLOBAL_RELEASE_TAG}"
 
 GLOBAL_DB_ZST_NAME = "global_metadata.db.zst"
 GLOBAL_DB_ZST_SHA256_NAME = "global_metadata.db.zst.sha256"
@@ -103,7 +101,7 @@ def _download(url, destination):
     request = Request(
         url,
         headers={
-            "User-Agent": "SteamLibraryTracker/global-metadata-bootstrap",
+            "User-Agent": f"{USER_AGENT} global-metadata-bootstrap",
             "Accept": "application/octet-stream",
         },
     )
@@ -230,7 +228,7 @@ def bootstrap_global_metadata(library_records):
         )
 
         with tempfile.TemporaryDirectory(
-            prefix="slt-global-metadata-"
+            prefix="pecetracker-global-metadata-"
         ) as temp_dir:
             temp_dir = Path(temp_dir)
 

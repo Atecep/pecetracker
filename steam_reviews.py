@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
-from version import APP_VERSION
+from version import USER_AGENT
 
 REVIEWS_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
 ANONYMOUS_INTERVAL_SECONDS = 10.0
@@ -100,7 +100,7 @@ class ReviewClient:
             try:
                 response = requests.get(
                     REVIEWS_URL, params={"input_json": json.dumps(query)},
-                    headers={"User-Agent": f"SteamLibraryTracker/{APP_VERSION}"},
+                    headers={"User-Agent": USER_AGENT},
                     timeout=15,
                 )
                 response.raise_for_status()

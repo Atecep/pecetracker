@@ -1,3 +1,4 @@
+from version import APP_NAME
 import math
 import platform
 import sqlite3
@@ -235,7 +236,7 @@ def _render_protondb_methodology(analysis):
     st.markdown(f"**ProtonDB confidence:** {confidence}")
     st.markdown(f"**Total ProtonDB reports:** {int(report_total):,}")
     st.markdown(
-        f"SLT analysed **{reports_analysed} community reports** from ProtonDB."
+        f"{APP_NAME} analysed **{reports_analysed} community reports** from ProtonDB."
     )
     st.caption(
         "Newer successful reports receive more weight in the ranking."
@@ -245,7 +246,7 @@ def _render_protondb_methodology(analysis):
     )
     st.caption(
         "Community launch options are untrusted user reports. "
-        "SLT only displays them; it never applies or executes them."
+        f"{APP_NAME} only displays them; it never applies or executes them."
     )
 
 
@@ -306,8 +307,8 @@ def show_protondb_analysis_dialog(appid, game_name):
         )
 
 
-def _slt_review_score(positive_percentage, total_reviews):
-    """Return the 95% Wilson lower bound used by SLT Review Score."""
+def _review_score(positive_percentage, total_reviews):
+    """Return the 95% Wilson lower bound used by Pecetracker Review Score."""
     if (
         positive_percentage is None
         or total_reviews is None
@@ -617,14 +618,14 @@ def show_game_details(game, df):
             ),
         )
 
-    slt_score = _slt_review_score(positive_percentage, total_reviews)
+    review_score = _review_score(positive_percentage, total_reviews)
 
-    if review_description or slt_score is not None:
+    if review_description or review_score is not None:
         review_secondary_parts = []
         if review_description:
             review_secondary_parts.append(f"Steam: {review_description}")
-        if slt_score is not None:
-            review_secondary_parts.append(f"SLT Score: {slt_score:.1f}%")
+        if review_score is not None:
+            review_secondary_parts.append(f"{APP_NAME} Score: {review_score:.1f}%")
 
         st.markdown(
             f'<div class="review-secondary-row">{" · ".join(review_secondary_parts)}</div>',

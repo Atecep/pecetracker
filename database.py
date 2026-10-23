@@ -28,7 +28,7 @@ def init_database():
 
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
-            raise RuntimeError("This database requires a newer SLT version.")
+            raise RuntimeError("This database requires a newer Pecetracker version.")
         if version == SCHEMA_VERSION:
             return
         # Serialize writers BEFORE inspecting the old schema. DDL and the
@@ -36,7 +36,7 @@ def init_database():
         conn.execute("BEGIN IMMEDIATE")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
-            raise RuntimeError("This database requires a newer SLT version.")
+            raise RuntimeError("This database requires a newer Pecetracker version.")
         if version == SCHEMA_VERSION:
             return
 

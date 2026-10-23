@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import platform
 from pathlib import Path
+from version import LEGACY_DATA_DIR_NAME
 
 
-APP_NAME = "SteamLibraryTracker"
+# Historical module alias: this is a directory identifier, not a display name.
+APP_NAME = LEGACY_DATA_DIR_NAME
 
 
 def get_app_data_dir() -> Path:

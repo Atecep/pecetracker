@@ -1,6 +1,9 @@
-# Building Steam Library Tracker
+# Building Pecetracker
 
-This document covers running Steam Library Tracker from source and producing standalone Windows and Linux builds.
+This document covers running Pecetracker from source and producing standalone Windows and Linux builds.
+
+**Your Steam Library, Tamed.** — A Steam library and backlog manager.
+Repository: https://github.com/Atecep/pecetracker
 
 ## Requirements
 
@@ -91,36 +94,37 @@ chmod +x build_linux.sh
 The result is created in:
 
 ```text
-dist/SteamLibraryTracker/
+dist/Pecetracker/
 ```
 
 Run it with:
 
 ```bash
-./dist/SteamLibraryTracker/SteamLibraryTracker
+./dist/Pecetracker/Pecetracker
 ```
 
-## 5. Create the release archive
+## 5. Local distribution archive
+
+The build script also creates `dist/Pecetracker-v1.5.0-linux-x86_64.tar.xz`
+(the architecture follows the build host). It does not publish anything.
+To recreate it manually:
 
 From the project root:
 
 ```bash
 cd dist
-tar -cJf SteamLibraryTracker-v1.2.0-linux-x86_64.tar.xz SteamLibraryTracker
+tar -cJf Pecetracker-v1.5.0-linux-x86_64.tar.xz Pecetracker
 ```
 
 ## Testing a freshly rebuilt Linux bundle
 
-Steam Library Tracker is single-instance.
+Pecetracker is single-instance.
 
 If an older development or packaged instance is still running, launching a freshly rebuilt copy may reopen the existing process instead of starting the new build.
 
-Before testing a new build from a clean state:
-
-```bash
-pkill -f SteamLibraryTracker
-pkill -f streamlit
-```
+Close the specific running app normally before testing the new build. For an
+isolated smoke, set `HOME`, `XDG_DATA_HOME` and `XDG_CONFIG_HOME` to a temporary
+directory before starting it. Do not use broad process-name termination commands.
 
 You can confirm the usual Streamlit ports are free with:
 
@@ -128,12 +132,10 @@ You can confirm the usual Streamlit ports are free with:
 ss -ltnp | grep -E ':850[1-9]'
 ```
 
-Close all SLT processes before removing stale instance state files. The current launcher holds an operating-system lock for its lifetime; deleting `instance.lock` while it is running breaks that ownership protocol.
-
-```bash
-rm -f ~/.local/share/SteamLibraryTracker/instance.json
-rm -f ~/.local/share/SteamLibraryTracker/instance.lock
-```
+The launcher holds an operating-system lock for its lifetime. Keep the legacy
+`SteamLibraryTracker/instance.lock` and `instance.json` paths; removing a live lock
+breaks ownership. Native locks are released on process exit; no manual cleanup
+or personal-data migration is part of the rebranding.
 
 Do not remove `config.json` or `library.db` unless you intentionally want to reset the application's local data.
 
@@ -211,29 +213,32 @@ python launcher.py
 The result is created in:
 
 ```text
-dist-windows\SteamLibraryTracker\
+dist-windows\Pecetracker\
 ```
 
 Run it with:
 
 ```powershell
-.\dist-windows\SteamLibraryTracker\SteamLibraryTracker.exe
+.\dist-windows\Pecetracker\Pecetracker.exe
 ```
 
 The Windows build is configured with `console=False`, so the final executable should open without a terminal window.
 
-## 7. Create the release archive
+## 7. Local distribution archive
+
+The PowerShell script also creates the following archive (architecture follows
+the build host), retaining the top-level `Pecetracker` directory:
 
 Compress:
 
 ```text
-dist-windows\SteamLibraryTracker\
+dist-windows\Pecetracker\
 ```
 
 into:
 
 ```text
-SteamLibraryTracker-v1.2.0-windows-x86_64.zip
+Pecetracker-v1.5.0-windows-x86_64.zip
 ```
 
 ---
@@ -243,8 +248,8 @@ SteamLibraryTracker-v1.2.0-windows-x86_64.zip
 The standalone builds use these project files:
 
 ```text
-SteamLibraryTracker.spec
-SteamLibraryTracker.windows.spec
+Pecetracker.spec
+Pecetracker.windows.spec
 build_linux.sh
 build_windows.ps1
 requirements-build.txt
@@ -273,6 +278,11 @@ Packaged builds store user data outside the application directory.
 
 This allows the application folder to be replaced during an update without overwriting user settings, notes or statuses.
 
+These historical paths are a compatibility contract and remain the defaults for
+new installations too. `library.db`, its schema, settings/backup, `slt.log` and its
+rotations, instance filenames/protocol/ownership records, and bootstrap state keys
+are unchanged. Versions sharing the same data home share the same instance lock.
+
 ---
 
 # Versioning
@@ -286,9 +296,9 @@ version.py
 For example:
 
 ```python
-APP_NAME = "Steam Library Tracker"
-APP_VERSION = "1.1.0"
-GITHUB_REPOSITORY = "Atecep/steam-library-tracker"
+APP_NAME = "Pecetracker"
+APP_VERSION = "1.5.0"
+GITHUB_REPOSITORY = "Atecep/pecetracker"
 ```
 
 Release tags should use the corresponding `v` prefix:
@@ -299,7 +309,15 @@ v1.0.1
 v1.1.0
 ```
 
-The update checker compares the installed application version with the latest published GitHub Release.
+APP_VERSION remains 1.5.0 during rebranding validation. The future 1.6.0 release is
+separate work. The scripts create local artifacts only; do not upload/rename old
+releases or assets. Keep `global-db` and all `global_metadata.db*` filenames stable.
+
+The update checker compares versions using the new repository. Old installed
+builds continue through GitHub's repository-rename redirects, so the old repository
+name must not be reused. A rebranding-only build at 1.5.0 is not advertised as an
+upgrade to an installed 1.5.0 build; compare behaviour using an isolated data home
+or close the existing instance normally.
 
 ## Regression tests
 
@@ -309,7 +327,7 @@ Run the offline suite using the installed build environment:
 python -B tests/run_tests.py
 ```
 
-The runner redirects application data/configuration paths to temporary directories before importing SLT and blocks real HTTP. Tests cover SQLite migration/rollback and concurrent writers, launcher ownership, settings recovery, workers, caches, HLTB matching, personal edits and real Streamlit widget behavior. GitHub Actions runs the same suite on Linux and Windows; a workflow definition alone is not evidence of a completed Windows run.
+The runner redirects application data/configuration paths to temporary directories before importing Pecetracker and blocks real HTTP. Tests cover SQLite migration/rollback and concurrent writers, launcher ownership, settings recovery, workers, caches, HLTB matching, personal edits and real Streamlit widget behavior. GitHub Actions runs the same suite on Linux and Windows; a workflow definition alone is not evidence of a completed Windows run.
 
 An optional Linux rendered smoke uses an installed Chromium-family browser, a private temporary browser profile, temporary SQLite and simulated metadata:
 
@@ -318,3 +336,19 @@ python -B tests/linux_browser_smoke.py --browser /path/to/chromium --output /tmp
 ```
 
 It checks literal search, game details, the Linux ProtonDB dialog/back navigation and explicit note saving, and writes screenshots/logs to the output directory. It does not validate a frozen executable or live metadata services.
+
+After building on Linux, a separate smoke exercises the actual frozen executable
+and renders its onboarding page in the browser:
+
+```bash
+python -B tests/linux_bundle_smoke.py \
+  --executable dist/Pecetracker/Pecetracker \
+  --browser /path/to/chromium \
+  --output /tmp/pecetracker-bundle-validation
+```
+
+It uses a temporary legacy data directory, blocks external metadata requests,
+checks SQLite/config hashes and a manual HLTB ID, and verifies that a second
+launch reopens the authenticated owner without replacing its native lock inode.
+Linux build/runtime evidence does not validate a Windows binary or portability
+to Linux distributions with an older glibc than the build host.

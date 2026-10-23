@@ -1,3 +1,4 @@
+from version import REVIEW_SCORE_LABEL
 import altair as alt
 import math
 import pandas as pd
@@ -730,8 +731,12 @@ def render_library(df):
             "HLTB Main Story",
             "HLTB Main + Extras",
             "HLTB Completionist",
-            "SLT Review Score",
+            REVIEW_SCORE_LABEL,
         ]
+
+        # Retain an existing browser session across the visible label change.
+        if st.session_state.get("library_sort_v2") == "SLT Review Score":
+            st.session_state.library_sort_v2 = REVIEW_SCORE_LABEL
 
         if "library_sort_v2" not in st.session_state:
             st.session_state.library_sort_v2 = "Hours Played"
@@ -950,10 +955,10 @@ def render_library(df):
         )
 
     # -----------------------------------------------------
-    # SLT Review Score
+    # Pecetracker Review Score
     # -----------------------------------------------------
 
-    elif sort_by == "SLT Review Score":
+    elif sort_by == REVIEW_SCORE_LABEL:
         # Reviews already live in the local SQLite metadata cache. Reading
         # them here never triggers a Steam request. Ranking uses the lower
         # bound of a 95% Wilson score interval so that tiny samples do not

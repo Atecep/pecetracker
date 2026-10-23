@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from version import APP_NAME
+
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_submodules,
@@ -92,7 +94,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="SteamLibraryTracker",
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -108,5 +110,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="SteamLibraryTracker",
+    name=APP_NAME,
 )

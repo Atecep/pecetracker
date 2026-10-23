@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 Set-Location $PSScriptRoot
 
-Write-Host "== Steam Library Tracker: Windows build =="
+Write-Host "== Pecetracker: Windows build =="
 
 function Assert-CommandSuccess {
     param(
@@ -27,24 +27,22 @@ Write-Host ("PyInstaller: " + (python -c "import PyInstaller; print(PyInstaller.
 Write-Host ("Streamlit:   " + (python -c "import streamlit; print(streamlit.__version__)"))
 Write-Host ""
 
-if (Test-Path "build-windows") {
-    Remove-Item "build-windows" -Recurse -Force
-}
-if (Test-Path "dist-windows") {
-    Remove-Item "dist-windows" -Recurse -Force
-}
-
 python -m PyInstaller `
     --clean `
     --noconfirm `
     --workpath build-windows `
     --distpath dist-windows `
-    SteamLibraryTracker.windows.spec
+    Pecetracker.windows.spec
 
 Assert-CommandSuccess "PyInstaller build failed."
+
+$archiveName = python -c "from version import distribution_archive_name; print(distribution_archive_name())"
+Assert-CommandSuccess "Could not determine the archive name."
+Compress-Archive -Path "dist-windows\Pecetracker" -DestinationPath "dist-windows\$archiveName" -Force
 
 Write-Host ""
 Write-Host "Build complete."
 Write-Host ""
 Write-Host "Run it with:"
-Write-Host "  .\dist-windows\SteamLibraryTracker\SteamLibraryTracker.exe"
+Write-Host "  .\dist-windows\Pecetracker\Pecetracker.exe"
+Write-Host "Archive: dist-windows\$archiveName (local artifact only; nothing published)"

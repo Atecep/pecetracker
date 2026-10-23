@@ -250,7 +250,7 @@ def terminate_process(pid: int, identity=None, force=False) -> None:
     Legacy files lack identity and are deliberately never used to kill a PID.
     """
     if pid <= 0 or pid == os.getpid() or not identity_matches(pid, identity):
-        raise RuntimeError("Cannot verify the existing instance. Close it manually before starting SLT.")
+        raise RuntimeError("Cannot verify the existing instance. Close it manually before starting Pecetracker.")
     if os.name == "nt":
         from ctypes import wintypes
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -321,7 +321,7 @@ def stop_older_instance(pid: int, identity=None) -> None:
             return
 
     raise RuntimeError(
-        "An older Steam Library Tracker instance could not be closed. "
+        "An older Pecetracker instance could not be closed. "
         "Close it manually and start the new version again."
     )
 
@@ -345,7 +345,7 @@ def reopen_existing_instance(
     wait_seconds: float = 0.0,
 ) -> bool:
     """
-    Reopen a compatible running Steam Library Tracker instance.
+    Reopen a compatible running Pecetracker instance.
 
     If the running instance is older than this launcher, stop it so the new
     version can start. If the running instance is newer, keep and reopen it.
@@ -359,7 +359,7 @@ def reopen_existing_instance(
             pid, port, existing_version = existing
             state = read_json(INSTANCE_STATE_PATH) or {}
             if state.get("protocol") != 2:
-                raise RuntimeError("A legacy SLT instance may be running. Close it manually before starting this version.")
+                raise RuntimeError("A legacy Pecetracker instance may be running. Close it manually before starting this version.")
             relation = compare_versions(
                 APP_VERSION,
                 existing_version,
@@ -416,21 +416,21 @@ def acquire_instance_lock() -> int:
             # A verified older process may have just exited. Retry the OS lock.
             existing = read_json(INSTANCE_STATE_PATH) or {}
             if pid_is_running(int(existing.get("pid") or 0)):
-                raise RuntimeError("SLT is already starting. Please wait and try again.")
+                raise RuntimeError("Pecetracker is already starting. Please wait and try again.")
             # Do not spin forever on a lock owned by an unknown process.
             file = os.fdopen(os.open(INSTANCE_LOCK_PATH, os.O_RDWR), "r+b")
             try:
                 _lock_file(file)
             except OSError:
                 file.close()
-                raise RuntimeError("Another launcher owns the instance lock. Close it before starting SLT.")
+                raise RuntimeError("Another launcher owns the instance lock. Close it before starting Pecetracker.")
         try:
             previous = read_json(INSTANCE_LOCK_PATH) or {}
             pid = int(previous.get("pid") or 0)
             # An old launcher did not hold an OS lock. Do not start alongside it
             # or infer ownership from its PID. Legacy instances need manual exit.
             if pid != own_pid and pid_is_running(pid) and previous.get("protocol") != 2:
-                raise RuntimeError("A legacy SLT instance may be running. Close it manually before starting this version.")
+                raise RuntimeError("A legacy Pecetracker instance may be running. Close it manually before starting this version.")
             _instance_token = secrets.token_hex(16)
             file.seek(0); file.truncate()
             file.write(json.dumps(_instance_record(own_pid)).encode("utf-8")); file.flush()

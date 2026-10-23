@@ -87,6 +87,16 @@ class LibraryInterfaceTests(unittest.TestCase):
         self.assertEqual(db.get_all_game_data()[620]['notes'],'first notes')
         self.assertEqual(len(self.app.exception),0)
 
+    def test_legacy_score_sort_label_retains_selection_after_rebranding(self):
+        # First render the old widget/options so its next submitted state is
+        # genuinely from the previous UI, rather than invalid new-widget data.
+        with patch('ui.library.REVIEW_SCORE_LABEL','SLT Review Score'):
+            self.app.run()
+            self.app.selectbox(key='library_sort_v2').select('SLT Review Score').run()
+        self.app.run()
+        self.assertEqual(self.app.selectbox(key='library_sort_v2').value,'Pecetracker Review Score')
+        self.assertEqual(len(self.app.exception),0)
+
 
 class ApplicationStartupTests(unittest.TestCase):
     def test_full_application_renders_configured_and_unconfigured_without_network(self):
@@ -105,4 +115,6 @@ class ApplicationStartupTests(unittest.TestCase):
                 with self.subTest(configured=configured),patch.object(settings,'load_settings',return_value=values):
                     app=AppTest.from_file(str(Path(__file__).resolve().parents[1]/'app.py'),default_timeout=10).run()
                     self.assertEqual(len(app.exception),0)
+                    self.assertTrue(any('Pecetracker' in m.value for m in app.markdown))
+                    self.assertTrue(any(c.value=='Your Steam Library, Tamed.' for c in app.caption))
                     if configured:self.assertTrue(any(b.key=='open_game_620' for b in app.button))

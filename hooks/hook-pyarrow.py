@@ -1,4 +1,4 @@
-# Cross-platform custom PyInstaller hook for Steam Library Tracker.
+# Cross-platform custom PyInstaller hook for Pecetracker.
 #
 # Keeps the PyArrow core used by Streamlit/Pandas for DataFrame serialisation
 # while excluding optional Arrow feature families that this app does not use.
