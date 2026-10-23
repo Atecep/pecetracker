@@ -24,6 +24,7 @@ from constants import (  # noqa: E402
     HLTB_REPEATED_ERROR_BACKOFF_SECONDS,
 )
 import hltb_service  # noqa: E402
+from steam_reviews import ReviewResponseError, retry_delay  # noqa: E402
 from steam_fetcher import (  # noqa: E402
     get_review_summary,
     get_store_details,
@@ -283,166 +284,80 @@ def sync_catalog(
 
 def _defer_steam_service(db_path, error):
     """Persist service-wide backoff, leaving failed rows eligible for later."""
-    response = getattr(error, "response", None)
-    status = getattr(response, "status_code", None)
-    if status == 429:
-        seconds = 900
-    elif isinstance(error, requests.RequestException) and (status is None or status >= 500):
-        seconds = 300
-    else:
+    if not isinstance(error, requests.RequestException):
         return False
-    value = response.headers.get("Retry-After") if response is not None else None
-    if value:
-        try:
-            seconds = max(seconds, float(value))
-        except ValueError:
-            from email.utils import parsedate_to_datetime
-            try:
-                seconds = max(seconds, parsedate_to_datetime(value).timestamp() - time.time())
-            except (TypeError, ValueError, OverflowError):
-                pass
-    seconds = min(seconds, 24 * 3600)
-    set_state(db_path, "steam_service_retry_after", time.time() + seconds)
+    seconds = retry_delay(error)
+    try:
+        previous = float(get_state(db_path, "steam_service_retry_after", "0"))
+    except (TypeError, ValueError):
+        previous = 0
+    set_state(db_path, "steam_service_retry_after", max(previous, time.time() + seconds))
     print(f"[steam] Service failure; deferring further requests for {seconds:.0f}s.")
     return True
 
 
-def update_steam(
-    db_path,
-    *,
-    limit,
-    pause_seconds,
-):
+def update_steam(db_path, *, limit, pause_seconds):
+    report = dict(selected=0, processed=0, details_ready=0, reviews_attempted=0,
+                  reviews_refreshed=0, review_errors=0, unavailable=0, errors=0,
+                  deferred=False)
+    games = steam_candidates(db_path, limit)
+    report["selected"] = len(games)
+    if not games:
+        print("[steam] Nothing to process.")
+        return report
     try:
         if time.time() < float(get_state(db_path, "steam_service_retry_after", "0")):
             print("[steam] Service cooldown is active; preserving pending work.")
-            return
+            report["deferred"] = True
+            return report
     except (TypeError, ValueError):
         pass
-    games = steam_candidates(
-        db_path,
-        limit,
-    )
-
-    if not games:
-        print("[steam] Nothing to process.")
-        return
-
-    print(
-        f"[steam] Processing {len(games)} games."
-    )
-
-    details_ready = 0
-    reviews_refreshed = 0
-    unavailable = 0
-    errors = 0
-
+    print(f"[steam] Processing {len(games)} games (anonymous reviews, >=10s between requests).")
     for index, game in enumerate(games, start=1):
         appid = int(game["appid"])
         name = game["name"]
-        refresh_kind = game.get(
-            "refresh_kind",
-            "full",
-        )
-
-        if refresh_kind == "reviews":
-            try:
-                reviews = get_review_summary(
-                    appid
-                )
-
-                if reviews is None:
-                    errors += 1
-                    print(
-                        f"[steam] Review summary unavailable "
-                        f"{appid} {name!r}"
-                    )
-                else:
-                    save_steam_reviews(
-                        db_path,
-                        appid,
-                        reviews,
-                    )
-                    reviews_refreshed += 1
-
-            except Exception as error:
-                errors += 1
-                print(
-                    f"[steam] Review error {appid} "
-                    f"{name!r}: {error}"
-                )
-                if _defer_steam_service(db_path, error):
-                    return
-
-        else:
-            try:
-                details = get_store_details(
-                    appid
-                )
-
+        phase = "details"
+        report["processed"] += 1
+        try:
+            ready = True
+            if game.get("refresh_kind", "full") != "reviews":
+                details = get_store_details(appid)
                 if details is None:
-                    save_steam_unavailable(
-                        db_path,
-                        appid,
-                    )
-                    unavailable += 1
+                    save_steam_unavailable(db_path, appid)
+                    report["unavailable"] += 1
+                    ready = False
                 else:
-                    save_steam_ready(
-                        db_path,
-                        details,
-                    )
-                    details_ready += 1
-
-                    # New/changed games also get a review refresh, but a
-                    # review failure must not discard valid Store details.
-                    try:
-                        reviews = get_review_summary(
-                            appid
-                        )
-
-                        if reviews is not None:
-                            save_steam_reviews(
-                                db_path,
-                                appid,
-                                reviews,
-                            )
-                            reviews_refreshed += 1
-                        else:
-                            errors += 1
-                            print(
-                                f"[steam] Review summary unavailable "
-                                f"{appid} {name!r}"
-                            )
-
-                    except Exception as review_error:
-                        errors += 1
-                        print(
-                            f"[steam] Review error {appid} "
-                            f"{name!r}: {review_error}"
-                        )
-                        if _defer_steam_service(db_path, review_error):
-                            return
-
-            except Exception as error:
-                # Temporary Store failures stay dirty and are retried later.
-                errors += 1
-                print(
-                    f"[steam] Error {appid} {name!r}: {error}"
-                )
-                if _defer_steam_service(db_path, error):
-                    return
-
+                    save_steam_ready(db_path, details)
+                    report["details_ready"] += 1
+            if ready:
+                phase = "reviews"
+                report["reviews_attempted"] += 1
+                reviews = get_review_summary(appid)
+                if reviews is None:
+                    raise ReviewResponseError("Steam reviews summary is unavailable.")
+                save_steam_reviews(db_path, appid, reviews)
+                report["reviews_refreshed"] += 1
+        except Exception as error:
+            report["errors"] += 1
+            if phase == "reviews":
+                report["review_errors"] += 1
+            print(f"[steam] {phase} error {appid} {name!r}: {error}")
+            if _defer_steam_service(db_path, error):
+                report["deferred"] = True
+                break
         if index % 10 == 0 or index == len(games):
-            print(
-                f"[steam] {index}/{len(games)} | "
-                f"{details_ready} details, "
-                f"{reviews_refreshed} reviews, "
-                f"{unavailable} unavailable, "
-                f"{errors} errors"
-            )
-
+            print(f"[steam] {index}/{len(games)} | {report['details_ready']} details, "
+                  f"{report['reviews_refreshed']} reviews, {report['unavailable']} unavailable, "
+                  f"{report['errors']} errors")
         if index < len(games):
             time.sleep(max(0.0, pause_seconds))
+    print("[steam] Run summary: " + json.dumps(report, sort_keys=True))
+    return report
+
+
+def steam_run_failed(report):
+    """No work is healthy; incomplete/deferred work must be visible to CI."""
+    return bool(report and (report["deferred"] or report["errors"]))
 
 
 def update_hltb(
@@ -622,11 +537,14 @@ def parse_args():
         action="store_true",
     )
 
+    parser.add_argument("--report", help="Write acquisition counters/status as JSON for CI diagnostics")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    steam_report = None
     db_path = Path(args.db)
 
     init_database(db_path)
@@ -677,11 +595,11 @@ def main():
 
             # Propagate worker failures instead of silently publishing a
             # partially failed update.
-            steam_future.result()
+            steam_report = steam_future.result()
             hltb_future.result()
 
     elif run_steam:
-        update_steam(
+        steam_report = update_steam(
             db_path,
             limit=args.steam_limit,
             pause_seconds=args.steam_pause,
@@ -695,6 +613,12 @@ def main():
         )
 
     print_stats(db_path)
+    report = {"steam": steam_report, "status": "incomplete" if steam_run_failed(steam_report) else "ok"}
+    if args.report:
+        Path(args.report).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if steam_run_failed(steam_report):
+        print("[steam] INCOMPLETE: requests failed or pending work was deferred; publication must not proceed.")
+        return 2
     return 0
 
 

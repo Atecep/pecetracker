@@ -30,6 +30,7 @@ project_hiddenimports = [
     "steam_api",
     "steam_cache",
     "steam_store",
+    "steam_reviews",
     "update_checker",
     "version",
     "ui",

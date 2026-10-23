@@ -73,7 +73,7 @@ After the initial bootstrap, the workflow runs twice daily:
 04:12 and 16:12 UTC.
 
 Scheduled limits:
-- Steam: 2500 games
+- Steam: 600 games
 - HLTB: 1300 games
 - HLTB throttle: 1.9 seconds
 
@@ -88,6 +88,53 @@ The desktop application's local HLTB no_match cache
 remains at 30 days.
 
 Only eligible records are refreshed during maintenance.
+
+## Official reviews API and a safe Actions validation
+
+Both acquisition paths use `steam_reviews.py` and Valve's
+[IUserReviewsService/GetAppReviews/v1](https://partner.steamgames.com/doc/webapi/IUserReviewsService).
+The request uses `input_json`, Helpful=0, languages=["all"], review_type=All=0,
+purchase_type=All=1 and the first page. Review descriptions remain English and
+off-topic filtering retains the previous default. Reviews are anonymous: the
+ordinary Steam Web API key used for the catalogue is not a publisher key and
+is never sent to this endpoint.
+
+Valve documents a lower shared anonymous limit but no numeric quota. The shared
+client enforces at least 10 seconds between request starts within the process,
+serializes concurrent callers, makes no immediate retries, and opens a circuit
+on HTTP, JSON, missing-summary and network failures. HTTP 429 backs off for at
+least 15 minutes; other failures for at least 5 minutes. A longer `Retry-After`
+(seconds or HTTP date) is honoured. The global builder persists the cooldown
+in its working database and stops the batch; desktop retries are also deferred.
+Other applications sharing the runner's public IP may consume the same limit,
+so the interval is a conservative policy, not a guarantee of Valve's quota.
+
+Existing counts and `reviews_fetched_at` are retained on failures. Only a
+validated first-page summary updates reviews; an HTTP 200 with an empty
+`response` is not evidence of zero reviews. Real zero-count summaries are valid.
+
+Before resuming scheduled publication:
+
+1. Push the migration commit, open **Actions → Update Global Metadata → Run
+   workflow**, and select the branch containing it. Rerunning old run #231
+   would still use its old commit.
+2. Set `steam_limit=3`, `hltb_limit=0`, `validation_only=true`. This downloads and
+   verifies the existing catalogue, skips catalogue sync, updates the runner's
+   disposable copy, and skips both publication steps. No release asset is reset
+   or replaced. Validation accepts at most 10 Steam games and no HLTB work.
+3. Check the logged **Source commit** and job summary/artifact
+   `metadata-acquisition-*`: `status=ok`, `reviews_attempted>0`,
+   `reviews_refreshed=reviews_attempted`, `review_errors=0`, `deferred=false`.
+   `selected=0` means no eligible work, not a successful API probe.
+4. Only after that check, run a small normal batch with `validation_only=false`,
+   then resume maintenance. Scheduled Steam batches are limited to 600 because
+   2500 anonymous calls at 10-second intervals exceed the 300-minute job limit.
+
+The builder's `--report PATH` writes per-run counters. Failed/deferred Steam
+work exits with code 2, so the job cannot publish or report Success after
+silently collecting no reviews. A report is retained even on this failure.
+No eligible work or disabled Steam work is distinguished by the counters and
+does not fail the run. Publication failure recovery remains unchanged.
 
 ## Measuring local ownership coverage
 

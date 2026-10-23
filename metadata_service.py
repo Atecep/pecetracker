@@ -25,6 +25,7 @@ from steam_store import (
     SteamStoreMetadataUnavailable,
     get_game_metadata as fetch_steam_metadata,
 )
+from steam_reviews import ReviewResponseError, retry_delay
 
 
 _fetch_locks_guard = threading.Lock()
@@ -97,7 +98,7 @@ def _record_store_unavailable(appid):
     return state
 
 
-def _record_temporary_failure(appid, error_type):
+def _record_temporary_failure(appid, error_type, retry_seconds=METADATA_FAILED_RETRY_SECONDS):
     """Persist a temporary retry without marking Store metadata unavailable."""
     current = get_metadata_fetch_status(appid) or {}
     current_state = current.get("state")
@@ -114,7 +115,7 @@ def _record_temporary_failure(appid, error_type):
         appid=appid,
         state=state,
         failure_count=int(current.get("failure_count") or 0),
-        next_retry_at=_retry_time_after(METADATA_FAILED_RETRY_SECONDS),
+        next_retry_at=_retry_time_after(max(METADATA_FAILED_RETRY_SECONDS, retry_seconds)),
         last_error=error_type,
     )
 
@@ -207,15 +208,18 @@ def get_game_metadata(
                 if status_code == 429
                 else "http_error"
             )
-            _record_temporary_failure(appid, error_type)
+            _record_temporary_failure(appid, error_type, retry_delay(error))
 
             if cached is not None and allow_stale_on_error:
                 return cached
 
             raise
 
-        except requests.RequestException:
-            _record_temporary_failure(appid, "network_error")
+        except requests.RequestException as error:
+            _record_temporary_failure(
+                appid, "reviews_unavailable" if isinstance(error, ReviewResponseError) else "network_error",
+                retry_delay(error),
+            )
 
             if cached is not None and allow_stale_on_error:
                 return cached

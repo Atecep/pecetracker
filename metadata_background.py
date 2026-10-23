@@ -11,6 +11,7 @@ from app_logging import get_logger
 from sqlite_support import is_busy
 
 import requests
+from steam_reviews import retry_delay
 
 from constants import (
     METADATA_BACKGROUND_BATCH_SIZE,
@@ -240,7 +241,7 @@ def _run_worker():
                 )
 
                 if status_code == 429:
-                    network_backoff = METADATA_RATE_LIMIT_BACKOFF_SECONDS
+                    network_backoff = max(METADATA_RATE_LIMIT_BACKOFF_SECONDS, retry_delay(error))
                     _log.info(
                         "[metadata] Steam rate limit detected; "
                         "background refresh is backing off."
@@ -248,12 +249,12 @@ def _run_worker():
                     break
 
                 if status_code is not None and status_code >= 500:
-                    network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
+                    network_backoff = max(METADATA_NETWORK_BACKOFF_SECONDS, retry_delay(error))
                     break
 
-            except requests.RequestException:
+            except requests.RequestException as error:
                 total_deferred += 1
-                network_backoff = METADATA_NETWORK_BACKOFF_SECONDS
+                network_backoff = max(METADATA_NETWORK_BACKOFF_SECONDS, retry_delay(error))
                 _log.info(
                     "[metadata] Network problem; background refresh "
                     "is backing off."

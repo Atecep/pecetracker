@@ -11,9 +11,13 @@ on:
         description: "HLTB games to process in this run"
         required: true
         default: "100"
+      validation_only:
+        description: "Small validation on the downloaded DB copy: skip catalogue sync and do not publish assets"
+        type: boolean
+        default: false
 
   schedule:
-    # Bootstrap phase: run every 2 hours at minute 12.
+    # Maintenance runs twice daily; anonymous reviews are paced separately.
     - cron: "12 4,16 * * *"
 
 permissions:
@@ -69,21 +73,63 @@ jobs:
 
       - name: Select batch sizes
         shell: bash
+        env:
+          INPUT_STEAM_LIMIT: ${{ inputs.steam_limit }}
+          INPUT_HLTB_LIMIT: ${{ inputs.hltb_limit }}
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "STEAM_LIMIT=${{ inputs.steam_limit }}" >> "$GITHUB_ENV"
-            echo "HLTB_LIMIT=${{ inputs.hltb_limit }}" >> "$GITHUB_ENV"
+            [[ "$INPUT_STEAM_LIMIT" =~ ^[0-9]+$ && "$INPUT_HLTB_LIMIT" =~ ^[0-9]+$ ]] || exit 1
+            echo "STEAM_LIMIT=$INPUT_STEAM_LIMIT" >> "$GITHUB_ENV"
+            echo "HLTB_LIMIT=$INPUT_HLTB_LIMIT" >> "$GITHUB_ENV"
           else
-            echo "STEAM_LIMIT=2500" >> "$GITHUB_ENV"
+            # 2500 x 10s exceeds the job's 300-minute timeout even before
+            # Store details/HLTB. Keep the anonymous review batch bounded.
+            echo "STEAM_LIMIT=600" >> "$GITHUB_ENV"
             echo "HLTB_LIMIT=1300" >> "$GITHUB_ENV"
           fi
 
       - name: Update global metadata
+        env:
+          VALIDATION_ONLY: ${{ inputs.validation_only || false }}
         run: |
+          extra_args=()
+          if [[ "$VALIDATION_ONLY" == "true" ]]; then
+            [[ "$STEAM_LIMIT" -ge 1 && "$STEAM_LIMIT" -le 10 && "$HLTB_LIMIT" -eq 0 ]] || { echo "Validation requires steam_limit=1..10, hltb_limit=0"; exit 1; }
+            extra_args+=(--skip-catalog)
+          fi
+          echo "Source commit: $GITHUB_SHA"
           python global_metadata/build_global_database.py \
             --steam-limit "$STEAM_LIMIT" \
             --hltb-limit "$HLTB_LIMIT" \
-            --hltb-pause 1.9
+            --hltb-pause 1.9 \
+            --report global_metadata/data/run-summary.json \
+            "${extra_args[@]}"
+
+      - name: Report acquisition health
+        if: ${{ always() }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path("global_metadata/data/run-summary.json")
+          if path.exists():
+              report = json.loads(path.read_text())
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+                  output.write("## Metadata acquisition\n\nSource: `" + os.environ["GITHUB_SHA"] + "`\n\n```json\n" + json.dumps(report, indent=2) + "\n```\n")
+              if report["status"] != "ok":
+                  print("::error::Metadata acquisition incomplete; cached reviews are preserved and publication is blocked.")
+          else:
+              print("::warning::No acquisition report; inspect the failed or skipped update step.")
+          PY
+
+      - name: Save acquisition report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-acquisition-${{ github.run_id }}-${{ github.run_attempt }}
+          path: global_metadata/data/run-summary.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Checkpoint and verify SQLite database
         run: |
@@ -151,6 +197,7 @@ jobs:
           cp global_metadata.db.sha256 global_metadata.db.sha256.next
 
       - name: Publish updated database safely
+        if: ${{ success() && !inputs.validation_only }}
         id: publish
         shell: bash
         run: |
@@ -427,6 +474,7 @@ jobs:
           echo "Safe publication complete."
 
       - name: Publish compressed database safely
+        if: ${{ success() && !inputs.validation_only }}
         id: publish_zst
         shell: bash
         run: |

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import requests
+from steam_reviews import get_review_summary
 
 
 APP_DETAILS_URL = (
     "https://store.steampowered.com/api/appdetails"
-)
-
-REVIEWS_URL = (
-    "https://store.steampowered.com/appreviews/{appid}"
 )
 
 HEADERS = {
@@ -132,68 +129,6 @@ def get_store_details(appid):
         "is_free": bool(
             data.get("is_free", False)
         ),
-    }
-
-
-def get_review_summary(appid):
-    appid = int(appid)
-
-    response = requests.get(
-        REVIEWS_URL.format(appid=appid),
-        params={
-            "json": 1,
-            "language": "all",
-            "purchase_type": "all",
-            "filter": "all",
-            "num_per_page": 1,
-        },
-        headers=HEADERS,
-        timeout=15,
-    )
-    response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("success") != 1:
-        return None
-
-    summary = data.get(
-        "query_summary",
-        {},
-    )
-
-    total_positive = int(
-        summary.get("total_positive", 0) or 0
-    )
-    total_negative = int(
-        summary.get("total_negative", 0) or 0
-    )
-    total_reviews = int(
-        summary.get("total_reviews", 0) or 0
-    )
-
-    positive_percentage = (
-        round(
-            total_positive
-            / total_reviews
-            * 100,
-            1,
-        )
-        if total_reviews > 0
-        else None
-    )
-
-    return {
-        "review_score": summary.get(
-            "review_score"
-        ),
-        "review_description": summary.get(
-            "review_score_desc"
-        ),
-        "total_positive": total_positive,
-        "total_negative": total_negative,
-        "total_reviews": total_reviews,
-        "positive_percentage": positive_percentage,
     }
 
 
