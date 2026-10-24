@@ -4,7 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       steam_limit:
-        description: "Steam games to process in this run"
+        description: "Steam Store details budget"
+        required: true
+        default: "100"
+      steam_reviews_limit:
+        description: "Independent Steam reviews budget"
         required: true
         default: "100"
       hltb_limit:
@@ -75,16 +79,17 @@ jobs:
         shell: bash
         env:
           INPUT_STEAM_LIMIT: ${{ inputs.steam_limit }}
+          INPUT_REVIEWS_LIMIT: ${{ inputs.steam_reviews_limit }}
           INPUT_HLTB_LIMIT: ${{ inputs.hltb_limit }}
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            [[ "$INPUT_STEAM_LIMIT" =~ ^[0-9]+$ && "$INPUT_HLTB_LIMIT" =~ ^[0-9]+$ ]] || exit 1
+            [[ "$INPUT_STEAM_LIMIT" =~ ^[0-9]+$ && "$INPUT_REVIEWS_LIMIT" =~ ^[0-9]+$ && "$INPUT_HLTB_LIMIT" =~ ^[0-9]+$ ]] || exit 1
             echo "STEAM_LIMIT=$INPUT_STEAM_LIMIT" >> "$GITHUB_ENV"
+            echo "STEAM_REVIEWS_LIMIT=$INPUT_REVIEWS_LIMIT" >> "$GITHUB_ENV"
             echo "HLTB_LIMIT=$INPUT_HLTB_LIMIT" >> "$GITHUB_ENV"
           else
-            # 2500 x 10s exceeds the job's 300-minute timeout even before
-            # Store details/HLTB. Keep the anonymous review batch bounded.
-            echo "STEAM_LIMIT=600" >> "$GITHUB_ENV"
+            echo "STEAM_LIMIT=2500" >> "$GITHUB_ENV"
+            echo "STEAM_REVIEWS_LIMIT=2500" >> "$GITHUB_ENV"
             echo "HLTB_LIMIT=1300" >> "$GITHUB_ENV"
           fi
 
@@ -94,12 +99,15 @@ jobs:
         run: |
           extra_args=()
           if [[ "$VALIDATION_ONLY" == "true" ]]; then
-            [[ "$STEAM_LIMIT" -ge 1 && "$STEAM_LIMIT" -le 10 && "$HLTB_LIMIT" -eq 0 ]] || { echo "Validation requires steam_limit=1..10, hltb_limit=0"; exit 1; }
+            [[ "$STEAM_LIMIT" -le 10 && "$STEAM_REVIEWS_LIMIT" -le 10 && "$((STEAM_LIMIT + STEAM_REVIEWS_LIMIT))" -ge 1 && "$HLTB_LIMIT" -eq 0 ]] || { echo "Validation requires each Steam budget=0..10, some Steam work, hltb_limit=0"; exit 1; }
             extra_args+=(--skip-catalog)
           fi
           echo "Source commit: $GITHUB_SHA"
-          python global_metadata/build_global_database.py \
+          python -u global_metadata/build_global_database.py \
             --steam-limit "$STEAM_LIMIT" \
+            --steam-reviews-limit "$STEAM_REVIEWS_LIMIT" \
+            --steam-reviews-pause 2 \
+            --steam-budget-seconds 9000 \
             --hltb-limit "$HLTB_LIMIT" \
             --hltb-pause 1.9 \
             --report global_metadata/data/run-summary.json \
@@ -116,8 +124,10 @@ jobs:
               report = json.loads(path.read_text())
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
                   output.write("## Metadata acquisition\n\nSource: `" + os.environ["GITHUB_SHA"] + "`\n\n```json\n" + json.dumps(report, indent=2) + "\n```\n")
-              if report["status"] != "ok":
-                  print("::error::Metadata acquisition incomplete; cached reviews are preserved and publication is blocked.")
+              if not report["publishable"]:
+                  raise SystemExit("::error::Fatal acquisition error; publication is blocked. Inspect the report.")
+              if report["status"] == "partial":
+                  print("::warning::Partial acquisition: valid transactions may be published; failed requests remain pending and cached reviews are preserved.")
           else:
               print("::warning::No acquisition report; inspect the failed or skipped update step.")
           PY

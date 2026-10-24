@@ -130,6 +130,22 @@ class OfficialReviewTests(unittest.TestCase):
             list(pool.map(attempt,(1,2,3)))
         self.assertEqual(get.call_count,1)
 
+    def test_builder_interval_is_configurable_without_changing_desktop_default(self):
+        client = reviews.ReviewClient(interval=2, circuit_on_invalid=False)
+        with patch.object(reviews.requests, 'get', return_value=response()):
+            client.get_summary(1)
+            client.get_summary(2)
+        self.assertEqual(self.clock[0], 102)
+        self.assertEqual(reviews.ReviewClient().interval, 10)
+
+    def test_builder_isolated_invalid_summary_does_not_open_shared_circuit(self):
+        client = reviews.ReviewClient(interval=2, circuit_on_invalid=False)
+        with patch.object(reviews.requests, 'get', side_effect=[response(EMPTY), response()]) as get:
+            with self.assertRaises(reviews.ReviewResponseError):
+                client.get_summary(1)
+            self.assertEqual(client.get_summary(2)['total_reviews'], 468841)
+        self.assertEqual(get.call_count, 2)
+
 
 class AcquisitionIntegrityTests(unittest.TestCase):
     def setUp(self):
@@ -172,49 +188,51 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 self.assertGreater(datetime.fromisoformat(status['next_retry_at']),datetime.now()+timedelta(seconds=7100))
 
     def test_global_full_and_reviews_only_paths_persist_new_summary(self):
-        with patch.object(builder,'get_store_details',side_effect=lambda n:{'appid':n}), patch.object(reviews.requests,'get',return_value=response()):
-            # One item prevents real interval waits while exercising actual client.
-            first=builder.update_steam(self.gp,limit=1,pause_seconds=0)
+        with patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), patch.object(reviews.requests, 'get', return_value=response()):
+            first = builder.update_steam(self.gp, limit=1, pause_seconds=0, reviews_pause_seconds=0)
         with global_db.connect(self.gp) as c:
             c.execute("UPDATE steam_metadata SET reviews_fetched_at='2020-01-01'")
             c.execute('DELETE FROM steam_catalog WHERE appid=2')
-        with patch.object(reviews,'_client',reviews.ReviewClient()), patch.object(reviews.requests,'get',return_value=response()):
-            second=builder.update_steam(self.gp,limit=1,pause_seconds=0)
-        self.assertEqual((first['details_ready'],first['reviews_refreshed']),(1,1))
-        self.assertEqual((second['details_ready'],second['reviews_refreshed']),(0,1))
+        with patch.object(reviews.requests, 'get', return_value=response()):
+            second = builder.update_steam(self.gp, limit=1, pause_seconds=0, reviews_pause_seconds=0)
+        self.assertEqual((first['details']['updated'], first['reviews']['updated']), (1, 1))
+        self.assertEqual((second['details']['updated'], second['reviews']['updated']), (0, 1))
 
-    def test_global_failure_preserves_counts_and_timestamp_and_stops_batch(self):
-        for kind in ('full','reviews'):
-            for failure in (response(EMPTY),response(status=429,headers={'Retry-After':'7200'}),requests.Timeout('fixture timeout')):
-                self.seed();global_db.set_state(self.gp,'steam_service_retry_after','0')
-                candidates=[{'appid':1,'name':'fixture','refresh_kind':kind},{'appid':2,'name':'other','refresh_kind':kind}]
-                with self.subTest(kind=kind,failure=failure), patch.object(reviews,'_client',reviews.ReviewClient()), patch.object(builder,'steam_candidates',return_value=candidates), patch.object(builder,'get_store_details',side_effect=lambda n:{'appid':n}), patch.object(reviews.requests,'get',side_effect=failure if isinstance(failure,Exception) else None,return_value=failure) as get, redirect_stdout(io.StringIO()):
-                    report=builder.update_steam(self.gp,limit=2,pause_seconds=0)
-                    repeated=builder.update_steam(self.gp,limit=2,pause_seconds=0)
-                self.assertEqual(get.call_count,1)
-                self.assertEqual(report['review_errors'],1)
-                self.assertTrue(builder.steam_run_failed(report));self.assertTrue(repeated['deferred'])
-                with global_db.connect(self.gp) as c:
-                    row=c.execute('SELECT total_reviews,reviews_fetched_at FROM steam_metadata WHERE appid=1').fetchone()
-                self.assertEqual(tuple(row),(468841,'2020-01-01T00:00:00'))
-                if getattr(failure,'status_code',None)==429:
-                    self.assertGreater(float(global_db.get_state(self.gp,'steam_service_retry_after')),reviews.time.time()+7100)
+    def test_global_failure_preserves_counts_and_timestamp_without_blocking_details(self):
+        for failure in (response(EMPTY), response(status=429, headers={'Retry-After': '7200'}), requests.Timeout('fixture timeout')):
+            self.seed()
+            with global_db.connect(self.gp) as c:
+                c.execute('DELETE FROM steam_fetch_retries')
+                c.execute("DELETE FROM updater_state WHERE key LIKE 'steam_%retry_after'")
+                c.execute('UPDATE steam_catalog SET steam_dirty=1')
+            with self.subTest(failure=failure), patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), patch.object(reviews.requests, 'get', side_effect=failure if isinstance(failure, Exception) else None, return_value=failure), redirect_stdout(io.StringIO()):
+                report = builder.update_steam(self.gp, limit=2, pause_seconds=0, reviews_pause_seconds=0)
+            self.assertEqual(report['details']['updated'], 2)
+            self.assertGreater(report['reviews']['errors'], 0)
+            self.assertFalse(builder.steam_run_failed(report))
+            self.assertTrue(builder.steam_run_partial(report))
+            with global_db.connect(self.gp) as c:
+                row = c.execute('SELECT total_reviews,reviews_fetched_at FROM steam_metadata WHERE appid=1').fetchone()
+            self.assertEqual(tuple(row), (468841, '2020-01-01T00:00:00'))
+            if getattr(failure, 'status_code', None) == 429:
+                self.assertGreater(float(global_db.get_state(self.gp, 'steam_reviews_retry_after')), reviews.time.time() + 7100)
 
-    def test_main_returns_nonzero_and_writes_report_when_no_reviews_could_be_fetched(self):
-        report_path=self.root/'report.json'
-        with patch.object(sys,'argv',['builder','--db',str(self.gp),'--skip-catalog','--steam-limit','2','--hltb-limit','0','--report',str(report_path)]), patch.object(builder,'get_store_details',side_effect=lambda n:{'appid':n}), patch.object(reviews.requests,'get',return_value=response(EMPTY)), redirect_stdout(io.StringIO()):
-            self.assertEqual(builder.main(),2)
-        report=json.loads(report_path.read_text())
-        self.assertEqual(report['status'],'incomplete')
-        self.assertEqual(report['steam']['reviews_refreshed'],0)
-        self.assertEqual(report['steam']['review_errors'],1)
+    def test_main_allows_valid_partial_progress_and_writes_visible_report(self):
+        report_path = self.root / 'report.json'
+        with patch.object(sys, 'argv', ['builder', '--db', str(self.gp), '--skip-catalog', '--steam-limit', '2', '--steam-pause', '0', '--steam-reviews-pause', '0', '--hltb-limit', '0', '--report', str(report_path)]), patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), patch.object(reviews.requests, 'get', return_value=response(EMPTY)), redirect_stdout(io.StringIO()):
+            self.assertEqual(builder.main(), 0)
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report['status'], 'partial')
+        self.assertTrue(report['publishable'])
+        self.assertEqual(report['steam']['reviews']['updated'], 0)
+        self.assertEqual(report['steam']['reviews']['errors'], 2)
 
     def test_no_due_work_is_success_without_claiming_a_review_refresh(self):
-        with patch.object(builder,'steam_candidates',return_value=[]):
-            report=builder.update_steam(self.gp,limit=2,pause_seconds=0)
+        with patch.object(builder, 'steam_details_candidates', return_value=[]), patch.object(builder, 'steam_review_candidates', return_value=[]):
+            report = builder.update_steam(self.gp, limit=2, pause_seconds=0)
         self.assertFalse(builder.steam_run_failed(report))
-        self.assertEqual(report['selected'],0)
-        self.assertEqual(report['reviews_refreshed'],0)
+        self.assertEqual(report['details']['selected'], 0)
+        self.assertEqual(report['reviews']['updated'], 0)
 
     def test_desktop_worker_obeys_long_retry_after_for_whole_batch(self):
         module=metadata_background
@@ -228,9 +246,10 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             module._run_worker()
         self.assertEqual(waits,[7200])
 
-    def test_partial_review_failure_cannot_be_silently_published(self):
-        with patch.object(builder,'get_store_details',side_effect=lambda n:{'appid':n}), patch.object(builder,'get_review_summary',side_effect=[reviews.parse_summary(REAL),reviews.ReviewResponseError('missing summary')]), redirect_stdout(io.StringIO()):
-            report=builder.update_steam(self.gp,limit=2,pause_seconds=0)
-        self.assertEqual(report['reviews_refreshed'],1)
-        self.assertEqual(report['review_errors'],1)
-        self.assertTrue(builder.steam_run_failed(report))
+    def test_partial_review_failure_is_visible_and_publishable(self):
+        with patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), patch.object(reviews.requests, 'get', side_effect=[response(), response(EMPTY)]), redirect_stdout(io.StringIO()):
+            report = builder.update_steam(self.gp, limit=2, pause_seconds=0, reviews_pause_seconds=0)
+        self.assertEqual(report['reviews']['updated'], 1)
+        self.assertEqual(report['reviews']['errors'], 1)
+        self.assertFalse(builder.steam_run_failed(report))
+        self.assertTrue(builder.steam_run_partial(report))

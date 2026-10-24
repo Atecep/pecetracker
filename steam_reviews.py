@@ -1,8 +1,8 @@
 """Anonymous IUserReviewsService client shared by desktop and catalogue jobs.
 
 Contract: https://partner.steamgames.com/doc/webapi/IUserReviewsService
-Valve publishes no numeric anonymous quota. Space requests conservatively and
-stop on errors rather than retrying a batch against the lower shared IP limit.
+Valve publishes no numeric anonymous quota. Callers choose request spacing and
+stop on service failures rather than retrying against the shared IP limit.
 The personal Steam Web API key is deliberately never passed to this service.
 """
 import json
@@ -73,8 +73,10 @@ def parse_summary(payload):
 
 
 class ReviewClient:
-    def __init__(self, interval=ANONYMOUS_INTERVAL_SECONDS):
-        self.interval = max(ANONYMOUS_INTERVAL_SECONDS, interval)
+    def __init__(self, interval=ANONYMOUS_INTERVAL_SECONDS, *, circuit_on_invalid=True):
+        # This is a caller policy, not a numeric quota published by Valve.
+        self.interval = max(0.0, float(interval))
+        self.circuit_on_invalid = circuit_on_invalid
         self._lock = threading.Lock()
         self._last_request = None
         self._retry_at = 0.0
@@ -112,8 +114,19 @@ class ReviewClient:
                     raise ReviewResponseError("Steam reviews returned invalid JSON.", response=response) from error
                 return parse_summary(payload)
             except requests.RequestException as error:
-                self._retry_at = time.monotonic() + retry_delay(error)
+                if self.circuit_on_invalid or is_service_failure(error):
+                    self._retry_at = time.monotonic() + retry_delay(error)
                 raise
+
+
+def is_service_failure(error):
+    """Rate limits, transport failures and upstream outages affect a lane."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return (isinstance(error, ReviewBackoff)
+            or status == 429 or (status is not None and status >= 500)
+            or (isinstance(error, requests.RequestException)
+                and not isinstance(error, ReviewResponseError) and status is None))
 
 
 _client = ReviewClient()

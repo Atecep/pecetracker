@@ -12,7 +12,7 @@ from constants import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STEAM_UNAVAILABLE_RETRY_DAYS = 30
 
 # Global-only Steam refresh policy.
@@ -154,6 +154,14 @@ def init_database(db_path):
                 value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS steam_fetch_retries (
+                appid INTEGER NOT NULL REFERENCES steam_catalog(appid) ON DELETE CASCADE,
+                service TEXT NOT NULL CHECK(service IN ('details', 'reviews')),
+                retry_after REAL NOT NULL,
+                last_error TEXT NOT NULL,
+                PRIMARY KEY(appid, service)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_catalog_steam_dirty
                 ON steam_catalog(steam_dirty, appid);
 
@@ -162,6 +170,9 @@ def init_database(db_path):
 
             CREATE INDEX IF NOT EXISTS idx_steam_fetched
                 ON steam_metadata(fetched_at);
+
+            CREATE INDEX IF NOT EXISTS idx_steam_reviews_due
+                ON steam_metadata(state, COALESCE(reviews_fetched_at, ''), appid);
 
             CREATE INDEX IF NOT EXISTS idx_hltb_fetched
                 ON hltb_metadata(fetched_at);
@@ -493,6 +504,49 @@ def steam_candidates(db_path, limit):
     return [dict(row) for row in rows]
 
 
+def steam_details_candidates(db_path, limit):
+    """Details have their own budget; review-only work cannot consume it."""
+    with connect(db_path) as conn:
+        rows = conn.execute("""
+            SELECT c.appid, c.name FROM steam_catalog c
+            LEFT JOIN steam_metadata s ON s.appid = c.appid
+            WHERE (c.steam_dirty = 1 OR s.appid IS NULL
+                OR (s.state = 'unavailable' AND s.fetched_at < ?)
+                OR (s.state = 'ready' AND s.fetched_at < ?))
+              AND NOT EXISTS (SELECT 1 FROM steam_fetch_retries r
+                WHERE r.appid = c.appid AND r.service = 'details' AND r.retry_after > ?)
+            ORDER BY c.steam_dirty DESC, COALESCE(s.fetched_at, ''), c.appid
+            LIMIT ?
+        """, (_cutoff_iso(STEAM_UNAVAILABLE_RETRY_DAYS),
+              _cutoff_iso(GLOBAL_STEAM_DETAILS_MAX_AGE_DAYS), _now().timestamp(), int(limit))).fetchall()
+    return [dict(row) for row in rows]
+
+
+def steam_review_candidates(db_path, limit):
+    """Oldest/missing summaries first, independently of catalogue dirtiness."""
+    with connect(db_path) as conn:
+        rows = conn.execute("""
+            SELECT c.appid, c.name FROM steam_catalog c
+            JOIN steam_metadata s ON s.appid = c.appid
+            WHERE s.state = 'ready'
+              AND COALESCE(s.reviews_fetched_at, '') < ?
+              AND NOT EXISTS (SELECT 1 FROM steam_fetch_retries r
+                WHERE r.appid = c.appid AND r.service = 'reviews' AND r.retry_after > ?)
+            ORDER BY COALESCE(s.reviews_fetched_at, ''), c.appid
+            LIMIT ?
+        """, (_cutoff_iso(GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS), _now().timestamp(), int(limit))).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_steam_error(db_path, appid, service, error, seconds):
+    with connect(db_path) as conn:
+        conn.execute("""INSERT INTO steam_fetch_retries VALUES (?, ?, ?, ?)
+            ON CONFLICT(appid, service) DO UPDATE SET
+              retry_after = excluded.retry_after, last_error = excluded.last_error
+        """, (int(appid), service, _now().timestamp() + seconds,
+              f"{type(error).__name__}: {error}"[:1000]))
+
+
 def save_steam_ready(db_path, metadata):
     """Save Steam Store details without touching cached review data."""
     appid = int(metadata["appid"])
@@ -544,6 +598,7 @@ def save_steam_ready(db_path, metadata):
             """,
             (appid,),
         )
+        conn.execute("DELETE FROM steam_fetch_retries WHERE appid = ? AND service = 'details'", (appid,))
 
 
 def save_steam_reviews(db_path, appid, reviews):
@@ -554,7 +609,7 @@ def save_steam_reviews(db_path, appid, reviews):
         return
 
     with connect(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE steam_metadata
             SET
@@ -580,6 +635,8 @@ def save_steam_reviews(db_path, appid, reviews):
                 appid,
             ),
         )
+        conn.execute("DELETE FROM steam_fetch_retries WHERE appid = ? AND service = 'reviews'", (appid,))
+        return cursor.rowcount == 1
 
 
 def save_steam_unavailable(db_path, appid):
@@ -607,6 +664,7 @@ def save_steam_unavailable(db_path, appid):
             """,
             (appid,),
         )
+        conn.execute("DELETE FROM steam_fetch_retries WHERE appid = ? AND service = 'details'", (appid,))
 
 
 def hltb_candidates(db_path, limit):

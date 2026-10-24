@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -24,9 +25,8 @@ from constants import (  # noqa: E402
     HLTB_REPEATED_ERROR_BACKOFF_SECONDS,
 )
 import hltb_service  # noqa: E402
-from steam_reviews import ReviewResponseError, retry_delay  # noqa: E402
+from steam_reviews import ReviewClient, ReviewResponseError, is_service_failure, retry_delay  # noqa: E402
 from steam_fetcher import (  # noqa: E402
-    get_review_summary,
     get_store_details,
 )
 
@@ -42,7 +42,9 @@ from global_database import (  # noqa: E402
     save_steam_unavailable,
     set_state,
     stats,
-    steam_candidates,
+    steam_details_candidates,
+    steam_review_candidates,
+    save_steam_error,
     upsert_catalog,
 )
 
@@ -282,82 +284,175 @@ def sync_catalog(
     )
 
 
-def _defer_steam_service(db_path, error):
-    """Persist service-wide backoff, leaving failed rows eligible for later."""
-    if not isinstance(error, requests.RequestException):
-        return False
-    seconds = retry_delay(error)
-    try:
-        previous = float(get_state(db_path, "steam_service_retry_after", "0"))
-    except (TypeError, ValueError):
-        previous = 0
-    set_state(db_path, "steam_service_retry_after", max(previous, time.time() + seconds))
-    print(f"[steam] Service failure; deferring further requests for {seconds:.0f}s.")
-    return True
+DEFAULT_REVIEWS_PAUSE = 2.0
+DEFAULT_STEAM_BUDGET_SECONDS = 150 * 60
 
 
-def update_steam(db_path, *, limit, pause_seconds):
-    report = dict(selected=0, processed=0, details_ready=0, reviews_attempted=0,
-                  reviews_refreshed=0, review_errors=0, unavailable=0, errors=0,
-                  deferred=False)
-    games = steam_candidates(db_path, limit)
-    report["selected"] = len(games)
-    if not games:
-        print("[steam] Nothing to process.")
-        return report
+def _lane_report(limit):
+    return dict(limit=limit, selected=0, attempted=0, updated=0, unavailable=0,
+                skipped=0, errors=0, deferred=False, budget_exhausted=False,
+                fatal_error=None, error_samples=[])
+
+
+def _record_steam_error(db_path, service, appid, error, report):
+    report["errors"] += 1
+    if len(report["error_samples"]) < 10:
+        report["error_samples"].append(dict(appid=appid, type=type(error).__name__, message=str(error)))
+    print(f"[steam-{service}] Error {appid}: {error}", flush=True)
+    # Leave both cached data and successful fetch dates untouched. A per-row
+    # delay prevents a permanently bad app from monopolising the next batch.
+    save_steam_error(db_path, appid, service, error, retry_delay(error))
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status in (401, 403):
+        raise RuntimeError(f"Steam {service} access denied (HTTP {status})") from error
+    if is_service_failure(error):
+        key = f"steam_{service}_retry_after"
+        until = time.time() + retry_delay(error)
+        previous = float(get_state(db_path, key, "0"))
+        set_state(db_path, key, max(previous, until))
+        report["deferred"] = True
+        print(f"[steam-{service}] Service cooldown; other workers continue.", flush=True)
+        return True
+    return False
+
+
+def _lane_cooling_down(db_path, service, report):
+    until = float(get_state(db_path, f"steam_{service}_retry_after", "0"))
+    # The migration's shared cooldown originated predominantly from reviews.
+    # Honour it there without carrying its restriction into Store details.
+    if service == "reviews":
+        until = max(until, float(get_state(db_path, "steam_service_retry_after", "0")))
+    if time.time() < until:
+        report["deferred"] = True
+        return True
+    return False
+
+
+def _update_details(db_path, report, pause_seconds, deadline, done):
+    started = time.monotonic()
+    consecutive_invalid = 0
     try:
-        if time.time() < float(get_state(db_path, "steam_service_retry_after", "0")):
-            print("[steam] Service cooldown is active; preserving pending work.")
-            report["deferred"] = True
-            return report
-    except (TypeError, ValueError):
-        pass
-    print(f"[steam] Processing {len(games)} games (anonymous reviews, >=10s between requests).")
-    for index, game in enumerate(games, start=1):
-        appid = int(game["appid"])
-        name = game["name"]
-        phase = "details"
-        report["processed"] += 1
-        try:
-            ready = True
-            if game.get("refresh_kind", "full") != "reviews":
-                details = get_store_details(appid)
-                if details is None:
-                    save_steam_unavailable(db_path, appid)
-                    report["unavailable"] += 1
-                    ready = False
-                else:
-                    save_steam_ready(db_path, details)
-                    report["details_ready"] += 1
-            if ready:
-                phase = "reviews"
-                report["reviews_attempted"] += 1
-                reviews = get_review_summary(appid)
-                if reviews is None:
-                    raise ReviewResponseError("Steam reviews summary is unavailable.")
-                save_steam_reviews(db_path, appid, reviews)
-                report["reviews_refreshed"] += 1
-        except Exception as error:
-            report["errors"] += 1
-            if phase == "reviews":
-                report["review_errors"] += 1
-            print(f"[steam] {phase} error {appid} {name!r}: {error}")
-            if _defer_steam_service(db_path, error):
-                report["deferred"] = True
+        games = steam_details_candidates(db_path, report["limit"])
+        report["selected"] = len(games)
+        if not games or _lane_cooling_down(db_path, "details", report):
+            return
+        for index, game in enumerate(games):
+            if index:
+                remaining = deadline - time.monotonic()
+                if remaining <= pause_seconds:
+                    report["budget_exhausted"] = True
+                    break
+                time.sleep(max(0.0, pause_seconds))
+            if time.monotonic() >= deadline:
+                report["budget_exhausted"] = True
                 break
-        if index % 10 == 0 or index == len(games):
-            print(f"[steam] {index}/{len(games)} | {report['details_ready']} details, "
-                  f"{report['reviews_refreshed']} reviews, {report['unavailable']} unavailable, "
-                  f"{report['errors']} errors")
-        if index < len(games):
-            time.sleep(max(0.0, pause_seconds))
-    print("[steam] Run summary: " + json.dumps(report, sort_keys=True))
+            appid = int(game["appid"])
+            report["attempted"] += 1
+            try:
+                details = get_store_details(appid)
+            except (requests.RequestException, ValueError) as error:
+                if _record_steam_error(db_path, "details", appid, error, report):
+                    break
+                # Repeated malformed responses can indicate an API contract change.
+                consecutive_invalid += 1
+                if consecutive_invalid >= 3:
+                    raise RuntimeError("Steam details returned 3 consecutive invalid responses") from error
+                continue
+            consecutive_invalid = 0
+            # DB/programming failures propagate; they are not acquisition errors.
+            if details is None:
+                save_steam_unavailable(db_path, appid)
+                report["unavailable"] += 1
+            else:
+                save_steam_ready(db_path, details)
+                report["updated"] += 1
+            if report["attempted"] % 100 == 0:
+                print(f"[steam-details] {report['attempted']}/{len(games)} | {report['updated']} updated", flush=True)
+    finally:
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        done.set()
+
+
+def _update_reviews(db_path, report, interval, deadline, details_done):
+    started = time.monotonic()
+    client = ReviewClient(interval=interval, circuit_on_invalid=False)
+    consecutive_invalid = 0
+    try:
+        if report["limit"] <= 0 or _lane_cooling_down(db_path, "reviews", report):
+            return
+        while report["attempted"] < report["limit"]:
+            if time.monotonic() + interval >= deadline:
+                report["budget_exhausted"] = True
+                break
+            # Read done BEFORE querying, so the last detail cannot be missed.
+            complete = details_done.is_set()
+            games = steam_review_candidates(db_path, report["limit"] - report["attempted"])
+            if not games:
+                if complete:
+                    break
+                details_done.wait(min(0.25, max(0.0, deadline - time.monotonic())))
+                continue
+            report["selected"] += len(games)
+            for game in games:
+                if time.monotonic() + interval >= deadline:
+                    report["budget_exhausted"] = True
+                    return
+                appid = int(game["appid"])
+                report["attempted"] += 1
+                try:
+                    summary = client.get_summary(appid)
+                    if summary is None:
+                        raise ReviewResponseError("Steam reviews summary is unavailable")
+                except requests.RequestException as error:
+                    if _record_steam_error(db_path, "reviews", appid, error, report):
+                        return
+                    consecutive_invalid += 1
+                    if consecutive_invalid >= 3:
+                        raise RuntimeError("Steam reviews returned 3 consecutive invalid responses") from error
+                    continue
+                consecutive_invalid = 0
+                if save_steam_reviews(db_path, appid, summary):
+                    report["updated"] += 1
+                else:
+                    report["skipped"] += 1
+                if report["attempted"] % 100 == 0:
+                    print(f"[steam-reviews] {report['attempted']}/{report['limit']} | {report['updated']} updated", flush=True)
+    finally:
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+
+
+def update_steam(db_path, *, limit, pause_seconds, reviews_limit=None,
+                 reviews_pause_seconds=DEFAULT_REVIEWS_PAUSE,
+                 budget_seconds=DEFAULT_STEAM_BUDGET_SECONDS):
+    """Run independent Store and reviews lanes, each with its own budget."""
+    details = _lane_report(limit)
+    reviews = _lane_report(limit if reviews_limit is None else reviews_limit)
+    done = threading.Event()
+    deadline = time.monotonic() + budget_seconds
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="steam") as executor:
+        futures = (
+            (details, executor.submit(_update_details, db_path, details, pause_seconds, deadline, done)),
+            (reviews, executor.submit(_update_reviews, db_path, reviews, reviews_pause_seconds, deadline, done)),
+        )
+        for lane, future in futures:
+            try:
+                future.result()
+            except Exception as error:
+                lane["fatal_error"] = f"{type(error).__name__}: {error}"
+                print(f"[steam] FATAL: {lane['fatal_error']}", flush=True)
+    report = dict(details=details, reviews=reviews)
+    print("[steam] Run summary: " + json.dumps(report, sort_keys=True), flush=True)
     return report
 
 
 def steam_run_failed(report):
-    """No work is healthy; incomplete/deferred work must be visible to CI."""
-    return bool(report and (report["deferred"] or report["errors"]))
+    return bool(report and any(report[lane]["fatal_error"] for lane in ("details", "reviews")))
+
+
+def steam_run_partial(report):
+    return bool(report and any(report[lane]["errors"] or report[lane]["deferred"]
+                              or report[lane]["budget_exhausted"] for lane in ("details", "reviews")))
 
 
 def update_hltb(
@@ -537,9 +632,22 @@ def parse_args():
         action="store_true",
     )
 
+    parser.add_argument("--steam-reviews-limit", type=int, default=None,
+                        help="Independent reviews budget; defaults to --steam-limit")
+    parser.add_argument("--steam-reviews-pause", type=float, default=DEFAULT_REVIEWS_PAUSE,
+                        help="Minimum seconds between anonymous review request starts")
+    parser.add_argument("--steam-budget-seconds", type=float, default=DEFAULT_STEAM_BUDGET_SECONDS,
+                        help="Time budget per Steam lane; reserves time for publication")
     parser.add_argument("--report", help="Write acquisition counters/status as JSON for CI diagnostics")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    limits = (args.steam_limit, args.hltb_limit, args.steam_reviews_limit)
+    if any(n is not None and n < 0 for n in limits):
+        parser.error("Batch limits must be non-negative")
+    if any(not math.isfinite(n) or n < 0 for n in
+           (args.steam_pause, args.steam_reviews_pause, args.steam_budget_seconds)):
+        parser.error("Steam intervals and time budgets must be finite and non-negative")
+    return args
 
 
 def main():
@@ -568,7 +676,7 @@ def main():
             max_pages=args.catalog_max_pages,
         )
 
-    run_steam = args.steam_limit > 0
+    run_steam = args.steam_limit > 0 or (args.steam_reviews_limit or 0) > 0
     run_hltb = args.hltb_limit > 0
 
     if run_steam and run_hltb:
@@ -585,6 +693,9 @@ def main():
                 db_path,
                 limit=args.steam_limit,
                 pause_seconds=args.steam_pause,
+                reviews_limit=args.steam_reviews_limit,
+                reviews_pause_seconds=args.steam_reviews_pause,
+                budget_seconds=args.steam_budget_seconds,
             )
             hltb_future = executor.submit(
                 update_hltb,
@@ -603,6 +714,9 @@ def main():
             db_path,
             limit=args.steam_limit,
             pause_seconds=args.steam_pause,
+            reviews_limit=args.steam_reviews_limit,
+            reviews_pause_seconds=args.steam_reviews_pause,
+            budget_seconds=args.steam_budget_seconds,
         )
 
     elif run_hltb:
@@ -613,12 +727,16 @@ def main():
         )
 
     print_stats(db_path)
-    report = {"steam": steam_report, "status": "incomplete" if steam_run_failed(steam_report) else "ok"}
+    report = {"steam": steam_report,
+              "status": "fatal" if steam_run_failed(steam_report) else "partial" if steam_run_partial(steam_report) else "ok",
+              "publishable": not steam_run_failed(steam_report)}
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if steam_run_failed(steam_report):
-        print("[steam] INCOMPLETE: requests failed or pending work was deferred; publication must not proceed.")
-        return 2
+        print("[steam] FATAL: publication blocked; inspect acquisition report.")
+        return 1
+    if steam_run_partial(steam_report):
+        print("[steam] PARTIAL: valid transactions may be published; failed requests remain due.")
     return 0
 
 

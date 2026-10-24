@@ -73,7 +73,8 @@ After the initial bootstrap, the workflow runs twice daily:
 04:12 and 16:12 UTC.
 
 Scheduled limits:
-- Steam: 600 games
+- Steam Store details: up to 2500 games
+- Steam reviews: up to 2500 summaries (independent budget)
 - HLTB: 1300 games
 - HLTB throttle: 1.9 seconds
 
@@ -89,52 +90,86 @@ remains at 30 days.
 
 Only eligible records are refreshed during maintenance.
 
-## Official reviews API and a safe Actions validation
+## Official reviews API, independent scheduling and publication
 
 Both acquisition paths use `steam_reviews.py` and Valve's
 [IUserReviewsService/GetAppReviews/v1](https://partner.steamgames.com/doc/webapi/IUserReviewsService).
-The request uses `input_json`, Helpful=0, languages=["all"], review_type=All=0,
-purchase_type=All=1 and the first page. Review descriptions remain English and
-off-topic filtering retains the previous default. Reviews are anonymous: the
-ordinary Steam Web API key used for the catalogue is not a publisher key and
-is never sent to this endpoint.
+Requests use `input_json`, Helpful=0, languages=["all"], review_type=All=0,
+purchase_type=All=1 and the first page. Descriptions remain English and off-topic
+filtering retains the previous default. The catalogue's ordinary Steam Web API
+key is never sent to reviews; an app-associated publisher key is a different
+credential.
 
-Valve documents a lower shared anonymous limit but no numeric quota. The shared
-client enforces at least 10 seconds between request starts within the process,
-serializes concurrent callers, makes no immediate retries, and opens a circuit
-on HTTP, JSON, missing-summary and network failures. HTTP 429 backs off for at
-least 15 minutes; other failures for at least 5 minutes. A longer `Retry-After`
-(seconds or HTTP date) is honoured. The global builder persists the cooldown
-in its working database and stops the batch; desktop retries are also deferred.
-Other applications sharing the runner's public IP may consume the same limit,
-so the interval is a conservative policy, not a guarantee of Valve's quota.
+Valve documents anonymous access, a lower shared limit and HTTP 429, without a
+numeric anonymous quota or reset interval. The global builder uses a configurable
+2-second minimum between review request starts, based on the limited observations
+in [the throughput audit](steam-throughput-audit.md). This is an operating policy,
+not a discovered quota. The desktop client's default remains 10 seconds.
 
-Existing counts and `reviews_fetched_at` are retained on failures. Only a
-validated first-page summary updates reviews; an HTTP 200 with an empty
-`response` is not evidence of zero reviews. Real zero-count summaries are valid.
+Three workers run concurrently: Store details, reviews and the existing HLTB
+worker. `--steam-limit` now budgets details only; `--steam-reviews-limit` budgets
+reviews separately (defaults to `--steam-limit` when omitted). Details keep their
+existing 2-second pause between games. Reviews can process already cached details
+while new details are being acquired and pick up new ready rows as they arrive.
+They select missing/oldest summaries independently of catalogue dirtiness; a
+catalogue change alone no longer forces a fresh review summary to be fetched.
+Review-only work does not consume the details budget. Disabling either Steam
+lane does not disable the other. HLTB limits, cadence and matching are unchanged.
 
-Before resuming scheduled publication:
+Each Steam lane has a 150-minute time budget (`--steam-budget-seconds 9000`),
+measured from their common start, rather than a combined request allowance.
+This reserves room within the existing 300-minute job timeout. An in-flight
+request can overrun this budget by its bounded HTTP timeout (Store may try two
+markets). HLTB retains its existing behavior and can still determine total run
+time. The selected count is an upper bound, not a promise of completed work.
 
-1. Push the migration commit, open **Actions → Update Pecetracker Global Metadata → Run
-   workflow**, and select the branch containing it. Rerunning old run #231
-   would still use its old commit.
-2. Set `steam_limit=3`, `hltb_limit=0`, `validation_only=true`. This downloads and
-   verifies the existing catalogue, skips catalogue sync, updates the runner's
-   disposable copy, and skips both publication steps. No release asset is reset
-   or replaced. Validation accepts at most 10 Steam games and no HLTB work.
-3. Check the logged **Source commit** and job summary/artifact
-   `metadata-acquisition-*`: `status=ok`, `reviews_attempted>0`,
-   `reviews_refreshed=reviews_attempted`, `review_errors=0`, `deferred=false`.
-   `selected=0` means no eligible work, not a successful API probe.
-4. Only after that check, run a small normal batch with `validation_only=false`,
-   then resume maintenance. Scheduled Steam batches are limited to 600 because
-   2500 anonymous calls at 10-second intervals exceed the 300-minute job limit.
+HTTP 429, transport failures and server errors stop only the affected Steam
+lane, without immediate retries. Its cooldown is persisted independently:
+`steam_details_retry_after` or `steam_reviews_retry_after`. Backoff is at least
+15 minutes for 429 and 5 minutes otherwise; a longer `Retry-After` (seconds or
+HTTP date) is honoured. The previous `steam_service_retry_after` is also honoured
+for reviews during migration, without blocking details.
 
-The builder's `--report PATH` writes per-run counters. Failed/deferred Steam
-work exits with code 2, so the job cannot publish or report Success after
-silently collecting no reviews. A report is retained even on this failure.
-No eligible work or disabled Steam work is distinguished by the counters and
-does not fail the run. Publication failure recovery remains unchanged.
+An isolated invalid summary/other app-specific acquisition failure records a
+per-app, per-service retry in `steam_fetch_retries` and continues with other apps.
+Failures never refresh review dates or replace old counts with zero. A validated
+summary containing explicit zero counts is valid. Successful row writes, dirty
+flags and retry cleanup commit in short SQLite transactions. The review success
+counter advances only when the database actually updates a ready row.
+
+`--report PATH` writes separate `details` and `reviews` objects: `limit`,
+`selected`, `attempted`, `updated`, `unavailable`, `skipped`, `errors`,
+`deferred`, `budget_exhausted`, `elapsed_seconds`, `fatal_error` and up to ten
+error samples. `selected` counts candidate apps for that lane, `attempted` counts
+app-level acquisition calls (Store can issue two HTTP requests), and reviews
+`updated` counts persisted aggregate summaries, not individual user reviews.
+The same app can appear in both lanes; do not add their counts to infer unique
+games. No eligible work reports zero, not a successful API validation.
+
+A run with isolated acquisition errors, a service cooldown or an exhausted time
+budget reports `status=partial`, `publishable=true` and exits zero. Actions emits
+a visible warning and retains the report; valid progress can pass the unchanged
+SQLite integrity/checksum checks and existing safe release promotion. Failed
+apps remain pending. HTTP 401/403, three consecutive malformed/app-specific
+responses in a lane, and unexpected database/programming errors report
+`status=fatal`, `publishable=false` and exit nonzero, blocking publication.
+Catalogue and uncaught worker failures also fail the job. The existing asset
+promotion/rollback mechanism is retained; raw and compressed asset pairs are
+promoted separately, as before.
+
+For a small Actions validation, select the branch containing this change, set
+`steam_limit=3`, `steam_reviews_limit=3`, `hltb_limit=0`, and
+`validation_only=true`. Each Steam budget must be 0..10 with at least one enabled.
+This checks a downloaded disposable DB, skips catalogue sync and both publication
+steps. Inspect both lane counters and `status`: a partial run can publish valid
+progress but is not evidence of a fully successful review probe. `updated=0`
+with no eligible candidates also does not validate the API. Rerunning an older
+workflow uses its original commit. No workflow needs to be dispatched to run the
+offline regressions:
+
+```bash
+.venv-build-linux/bin/python -B tests/run_tests.py
+```
 
 ## Measuring local ownership coverage
 
@@ -146,4 +181,4 @@ python global_metadata/check_library_coverage.py /path/to/global_metadata.db
 
 Coverage uses the last successful ownership snapshot for the configured account, including games with no personal edits. Use `--steam-id STEAMID64` to select another account with a saved snapshot. Older installations need one successful library refresh to create this snapshot; the tool no longer substitutes edited-game rows as the denominator.
 
-The desktop bootstrap retains the catalogue's original fetch dates. It does not renew cache freshness when copying rows. The desktop and global matcher reject conflicting sequel numbers, while manual local HLTB IDs remain authoritative. Global Steam HTTP 429/server/network failures pause the rest of a batch and persist a service cooldown for the next run.
+The desktop bootstrap retains the catalogue's original fetch dates. It does not renew cache freshness when copying rows. The desktop and global matcher reject conflicting sequel numbers, while manual local HLTB IDs remain authoritative. Global Steam HTTP 429/server/network failures pause only the affected Steam lane and persist its cooldown for the next run.

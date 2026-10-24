@@ -66,10 +66,13 @@ def _request_store_entry(appid, cc=None):
     )
     response.raise_for_status()
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise ValueError("Steam Store returned invalid JSON") from error
 
     if not isinstance(payload, dict):
-        return None
+        raise ValueError("Steam Store returned an invalid details payload")
 
     return _find_app_entry(
         payload,

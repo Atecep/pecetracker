@@ -458,7 +458,8 @@ class SQLiteProgressTests(OfflineTest):
              patch.object(builder, "update_steam", return_value=None) as steam, patch.object(builder, "update_hltb") as hltb:
             self.assertEqual(builder.main(), 0)
         catalog.assert_called_once()
-        steam.assert_called_once_with(self.path, limit=100, pause_seconds=2)
+        steam.assert_called_once_with(self.path, limit=100, pause_seconds=2, reviews_limit=None,
+                                      reviews_pause_seconds=2, budget_seconds=9000)
         hltb.assert_called_once_with(self.path, limit=500, pause_seconds=2)
 
     def test_batch_limit_of_500_leaves_remaining_game_eligible(self):
