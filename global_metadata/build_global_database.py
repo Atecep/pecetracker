@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import threading
 import time
@@ -110,7 +111,7 @@ def _throttled_hltb_search_once(query):
     results = _run_hltb_request(query)
 
     if results is not None:
-        return results
+        return _validate_hltb_results(results)
 
     # One retry for a temporary HLTB/request failure. The existing builder
     # backoff still applies if the retry also fails.
@@ -123,6 +124,22 @@ def _throttled_hltb_search_once(query):
             f"HowLongToBeat search failed for query {query!r}"
         )
 
+    return _validate_hltb_results(results)
+
+
+def _validate_hltb_results(results):
+    # Only a valid empty result means no match. Malformed responses must leave
+    # the game pending, even if the matcher would otherwise skip bad entries.
+    if not isinstance(results, list):
+        raise ValueError("HowLongToBeat returned an invalid search result")
+    for entry in results:
+        try:
+            game_id = int(getattr(entry, "game_id", None))
+        except (TypeError, ValueError) as error:
+            raise ValueError("HowLongToBeat returned an invalid game ID") from error
+        name = getattr(entry, "game_name", None)
+        if game_id <= 0 or not isinstance(name, str) or not name.strip():
+            raise ValueError("HowLongToBeat returned an invalid game entry")
     return results
 
 
@@ -294,6 +311,13 @@ def _lane_report(limit):
                 fatal_error=None, error_samples=[])
 
 
+def _finish_lane_report(report, started):
+    report["completed"] = report["updated"] + report["unavailable"]
+    report["pending"] = report["selected"] - report["completed"]
+    report["not_attempted"] = report["selected"] - report["attempted"]
+    report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+
+
 def _record_steam_error(db_path, service, appid, error, report):
     report["errors"] += 1
     if len(report["error_samples"]) < 10:
@@ -302,10 +326,6 @@ def _record_steam_error(db_path, service, appid, error, report):
     # Leave both cached data and successful fetch dates untouched. A per-row
     # delay prevents a permanently bad app from monopolising the next batch.
     save_steam_error(db_path, appid, service, error, retry_delay(error))
-    response = getattr(error, "response", None)
-    status = getattr(response, "status_code", None)
-    if status in (401, 403):
-        raise RuntimeError(f"Steam {service} access denied (HTTP {status})") from error
     if is_service_failure(error):
         key = f"steam_{service}_retry_after"
         until = time.time() + retry_delay(error)
@@ -331,7 +351,6 @@ def _lane_cooling_down(db_path, service, report):
 
 def _update_details(db_path, report, pause_seconds, deadline, done):
     started = time.monotonic()
-    consecutive_invalid = 0
     try:
         games = steam_details_candidates(db_path, report["limit"])
         report["selected"] = len(games)
@@ -354,12 +373,7 @@ def _update_details(db_path, report, pause_seconds, deadline, done):
             except (requests.RequestException, ValueError) as error:
                 if _record_steam_error(db_path, "details", appid, error, report):
                     break
-                # Repeated malformed responses can indicate an API contract change.
-                consecutive_invalid += 1
-                if consecutive_invalid >= 3:
-                    raise RuntimeError("Steam details returned 3 consecutive invalid responses") from error
                 continue
-            consecutive_invalid = 0
             # DB/programming failures propagate; they are not acquisition errors.
             if details is None:
                 save_steam_unavailable(db_path, appid)
@@ -370,48 +384,48 @@ def _update_details(db_path, report, pause_seconds, deadline, done):
             if report["attempted"] % 100 == 0:
                 print(f"[steam-details] {report['attempted']}/{len(games)} | {report['updated']} updated", flush=True)
     finally:
-        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        _finish_lane_report(report, started)
         done.set()
 
 
 def _update_reviews(db_path, report, interval, deadline, details_done):
     started = time.monotonic()
     client = ReviewClient(interval=interval, circuit_on_invalid=False)
-    consecutive_invalid = 0
+    attempted_appids = set()
     try:
-        if report["limit"] <= 0 or _lane_cooling_down(db_path, "reviews", report):
+        if report["limit"] <= 0:
             return
         while report["attempted"] < report["limit"]:
-            if time.monotonic() + interval >= deadline:
-                report["budget_exhausted"] = True
-                break
             # Read done BEFORE querying, so the last detail cannot be missed.
             complete = details_done.is_set()
-            games = steam_review_candidates(db_path, report["limit"] - report["attempted"])
+            games = steam_review_candidates(db_path, report["limit"] - report["attempted"],
+                                            exclude_appids=attempted_appids)
+            report["selected"] += len(games)
+            if _lane_cooling_down(db_path, "reviews", report):
+                return
+            if time.monotonic() + interval >= deadline:
+                report["budget_exhausted"] = True
+                return
             if not games:
                 if complete:
                     break
                 details_done.wait(min(0.25, max(0.0, deadline - time.monotonic())))
                 continue
-            report["selected"] += len(games)
             for game in games:
                 if time.monotonic() + interval >= deadline:
                     report["budget_exhausted"] = True
                     return
                 appid = int(game["appid"])
+                attempted_appids.add(appid)
                 report["attempted"] += 1
                 try:
                     summary = client.get_summary(appid)
                     if summary is None:
                         raise ReviewResponseError("Steam reviews summary is unavailable")
-                except requests.RequestException as error:
+                except (requests.RequestException, ValueError) as error:
                     if _record_steam_error(db_path, "reviews", appid, error, report):
                         return
-                    consecutive_invalid += 1
-                    if consecutive_invalid >= 3:
-                        raise RuntimeError("Steam reviews returned 3 consecutive invalid responses") from error
                     continue
-                consecutive_invalid = 0
                 if save_steam_reviews(db_path, appid, summary):
                     report["updated"] += 1
                 else:
@@ -419,7 +433,7 @@ def _update_reviews(db_path, report, interval, deadline, details_done):
                 if report["attempted"] % 100 == 0:
                     print(f"[steam-reviews] {report['attempted']}/{report['limit']} | {report['updated']} updated", flush=True)
     finally:
-        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        _finish_lane_report(report, started)
 
 
 def update_steam(db_path, *, limit, pause_seconds, reviews_limit=None,
@@ -461,10 +475,26 @@ def update_hltb(
     limit,
     pause_seconds,
 ):
+    report = _lane_report(limit)
+    report.update(matched=0, no_match=0)
+    started = time.monotonic()
+    try:
+        _update_hltb(db_path, report, limit=limit, pause_seconds=pause_seconds)
+    except Exception as error:
+        report["fatal_error"] = f"{type(error).__name__}: {error}"
+        print(f"[hltb] FATAL: {report['fatal_error']}", flush=True)
+    finally:
+        _finish_lane_report(report, started)
+    print("[hltb] Run summary: " + json.dumps(report, sort_keys=True), flush=True)
+    return report
+
+
+def _update_hltb(db_path, report, *, limit, pause_seconds):
     games = hltb_candidates(
         db_path,
         limit,
     )
+    report["selected"] = len(games)
 
     if not games:
         print("[hltb] Nothing to process.")
@@ -491,32 +521,19 @@ def update_hltb(
     for index, game in enumerate(games, start=1):
         appid = int(game["appid"])
         name = str(game["name"] or "").strip()
+        report["attempted"] += 1
 
         try:
             # Reuse the exact v1.3.0 matcher without changing hltb_service.py.
             result = search_hltb_global(name)
-
-            if result is None:
-                save_hltb_no_match(
-                    db_path,
-                    appid,
-                    name,
-                )
-                no_match += 1
-            else:
-                save_hltb_match(
-                    db_path,
-                    appid,
-                    name,
-                    result,
-                )
-                matched += 1
-
-            consecutive_errors = 0
-
+        except sqlite3.DatabaseError:
+            raise
         except Exception as error:
             # Never persist a temporary/network error as no_match.
             errors += 1
+            report["errors"] += 1
+            if len(report["error_samples"]) < 10:
+                report["error_samples"].append(dict(appid=appid, type=type(error).__name__, message=str(error)))
             consecutive_errors += 1
 
             cooldown = save_hltb_error(
@@ -538,6 +555,18 @@ def update_hltb(
             )
 
             time.sleep(max(0.0, backoff))
+        else:
+            # Persistence/integrity failures must never become acquisition errors.
+            if result is None:
+                save_hltb_no_match(db_path, appid, name)
+                no_match += 1
+                report["no_match"] += 1
+            else:
+                save_hltb_match(db_path, appid, name, result)
+                matched += 1
+                report["matched"] += 1
+            report["updated"] += 1
+            consecutive_errors = 0
 
         if index % 10 == 0 or index == len(games):
             print(
@@ -653,6 +682,7 @@ def parse_args():
 def main():
     args = parse_args()
     steam_report = None
+    hltb_report = None
     db_path = Path(args.db)
 
     init_database(db_path)
@@ -704,10 +734,10 @@ def main():
                 pause_seconds=args.hltb_pause,
             )
 
-            # Propagate worker failures instead of silently publishing a
-            # partially failed update.
+            # Acquisition failures are reported as partial progress. Only unsafe
+            # database/worker failures block publication.
             steam_report = steam_future.result()
-            hltb_future.result()
+            hltb_report = hltb_future.result()
 
     elif run_steam:
         steam_report = update_steam(
@@ -720,23 +750,25 @@ def main():
         )
 
     elif run_hltb:
-        update_hltb(
+        hltb_report = update_hltb(
             db_path,
             limit=args.hltb_limit,
             pause_seconds=args.hltb_pause,
         )
 
     print_stats(db_path)
-    report = {"steam": steam_report,
-              "status": "fatal" if steam_run_failed(steam_report) else "partial" if steam_run_partial(steam_report) else "ok",
-              "publishable": not steam_run_failed(steam_report)}
+    fatal = steam_run_failed(steam_report) or bool(hltb_report and hltb_report["fatal_error"])
+    partial = steam_run_partial(steam_report) or bool(hltb_report and hltb_report["errors"])
+    report = {"steam": steam_report, "hltb": hltb_report,
+              "status": "fatal" if fatal else "partial" if partial else "ok",
+              "publishable": not fatal}
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    if steam_run_failed(steam_report):
-        print("[steam] FATAL: publication blocked; inspect acquisition report.")
+    if fatal:
+        print("[global-db] FATAL: publication blocked; inspect acquisition report.")
         return 1
-    if steam_run_partial(steam_report):
-        print("[steam] PARTIAL: valid transactions may be published; failed requests remain due.")
+    if partial:
+        print("[global-db] PARTIAL: valid transactions may be published; failed requests remain due.")
     return 0
 
 

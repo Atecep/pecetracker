@@ -522,19 +522,22 @@ def steam_details_candidates(db_path, limit):
     return [dict(row) for row in rows]
 
 
-def steam_review_candidates(db_path, limit):
+def steam_review_candidates(db_path, limit, *, exclude_appids=()):
     """Oldest/missing summaries first, independently of catalogue dirtiness."""
+    excluded = tuple(int(appid) for appid in exclude_appids)
+    exclusion = "AND c.appid NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
     with connect(db_path) as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT c.appid, c.name FROM steam_catalog c
             JOIN steam_metadata s ON s.appid = c.appid
             WHERE s.state = 'ready'
               AND COALESCE(s.reviews_fetched_at, '') < ?
               AND NOT EXISTS (SELECT 1 FROM steam_fetch_retries r
                 WHERE r.appid = c.appid AND r.service = 'reviews' AND r.retry_after > ?)
+              {exclusion}
             ORDER BY COALESCE(s.reviews_fetched_at, ''), c.appid
             LIMIT ?
-        """, (_cutoff_iso(GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS), _now().timestamp(), int(limit))).fetchall()
+        """, (_cutoff_iso(GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS), _now().timestamp(), *excluded, int(limit))).fetchall()
     return [dict(row) for row in rows]
 
 

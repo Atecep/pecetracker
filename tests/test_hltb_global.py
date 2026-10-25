@@ -283,6 +283,14 @@ class SearchTimingTests(OfflineTest):
             library.return_value.search.assert_called_once()
         self.sleep.assert_not_called()
 
+    def test_malformed_search_results_are_errors_instead_of_no_match(self):
+        for results in ({}, '', [None], [SimpleNamespace(game_id=None, game_name='Portal')],
+                        [SimpleNamespace(game_id=20, game_name=None)]):
+            with self.subTest(results=results), \
+                 patch.object(builder, '_run_hltb_request', return_value=results):
+                with self.assertRaises(ValueError):
+                    builder.search_hltb_global('Portal')
+
     def test_exceptions_keep_original_no_retry_behaviour_and_restore_matcher(self):
         original = matcher._search_once
         with patch.object(builder, "HowLongToBeat") as library:
@@ -455,7 +463,7 @@ class SQLiteProgressTests(OfflineTest):
         argv = ["builder", "--db", str(self.path), "--steam-limit", "100", "--hltb-limit", "500", "--hltb-pause", "2"]
         with patch.object(sys, "argv", argv), patch.dict(builder.os.environ, {"STEAM_WEB_API_KEY": "fixture-key"}), \
              patch.object(builder, "sync_catalog") as catalog, \
-             patch.object(builder, "update_steam", return_value=None) as steam, patch.object(builder, "update_hltb") as hltb:
+             patch.object(builder, "update_steam", return_value=None) as steam, patch.object(builder, "update_hltb", return_value=None) as hltb:
             self.assertEqual(builder.main(), 0)
         catalog.assert_called_once()
         steam.assert_called_once_with(self.path, limit=100, pause_seconds=2, reviews_limit=None,

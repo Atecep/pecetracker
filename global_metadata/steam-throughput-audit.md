@@ -1,5 +1,8 @@
 # Steam throughput audit — 2026-10-24
 
+Follow-up: the [25 Oct publication recovery audit](publication-recovery-audit.md)
+documents the remaining acquisition-to-fatal regression and its correction.
+
 The reduction in b701c18 combined two independent workloads under a 600-app
 selection limit and a reviews client with a hard 10-second floor. It also made
 any acquisition error fail the whole publication. The historical 2500-app

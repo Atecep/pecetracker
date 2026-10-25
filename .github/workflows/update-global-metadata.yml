@@ -94,6 +94,7 @@ jobs:
           fi
 
       - name: Update global metadata
+        id: acquire
         env:
           VALIDATION_ONLY: ${{ inputs.validation_only || false }}
         run: |
@@ -115,6 +116,8 @@ jobs:
 
       - name: Report acquisition health
         if: ${{ always() }}
+        env:
+          ACQUISITION_OUTCOME: ${{ steps.acquire.outcome }}
         run: |
           python - <<'PY'
           import json, os
@@ -123,12 +126,21 @@ jobs:
           if path.exists():
               report = json.loads(path.read_text())
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
-                  output.write("## Metadata acquisition\n\nSource: `" + os.environ["GITHUB_SHA"] + "`\n\n```json\n" + json.dumps(report, indent=2) + "\n```\n")
+                  output.write("## Metadata acquisition\n\nSource: `" + os.environ["GITHUB_SHA"] + "`\n\n")
+                  output.write("| Service | Selected | Attempted | Completed | Failed | Pending | Committed locally |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+                  lanes = {**(report.get("steam") or {}), "hltb": report.get("hltb")}
+                  for name, lane in lanes.items():
+                      if lane:
+                          values = [lane[key] for key in ("selected", "attempted", "completed", "errors", "pending", "updated")]
+                          output.write("| " + name + " | " + " | ".join(map(str, values)) + " |\n")
+                  output.write("\nPending includes failed requests and selected work not committed. Counts are per service, not unique games. Local commits are published only after verified asset promotion.\n\n```json\n" + json.dumps(report, indent=2) + "\n```\n")
               if not report["publishable"]:
                   raise SystemExit("::error::Fatal acquisition error; publication is blocked. Inspect the report.")
               if report["status"] == "partial":
-                  print("::warning::Partial acquisition: valid transactions may be published; failed requests remain pending and cached reviews are preserved.")
+                  print("::warning::Recoverable acquisition failures or deferred work: valid transactions may be published; failed requests remain pending and cached data is preserved.")
           else:
+              if os.environ["ACQUISITION_OUTCOME"] == "success":
+                  raise SystemExit("::error::Missing acquisition report after successful update; cannot establish safe publication.")
               print("::warning::No acquisition report; inspect the failed or skipped update step.")
           PY
 
@@ -150,11 +162,14 @@ jobs:
           db = Path("global_metadata/data/global_metadata.db")
 
           with sqlite3.connect(db) as conn:
-              conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-              result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+              checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+              result = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+              foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
 
-          if result != "ok":
-              raise SystemExit(f"SQLite integrity check failed: {result}")
+          if checkpoint[0] != 0:
+              raise SystemExit(f"SQLite checkpoint incomplete: {checkpoint}")
+          if result != ["ok"] or foreign_keys:
+              raise SystemExit(f"SQLite integrity check failed: {result}; foreign keys: {foreign_keys}")
 
           print("SQLite integrity check: ok")
           PY
@@ -791,6 +806,42 @@ jobs:
           fi
 
           echo "Compressed publication complete."
+
+      - name: Report publication outcome
+        if: ${{ always() }}
+        env:
+          RAW_OUTCOME: ${{ steps.publish.outcome }}
+          COMPRESSED_OUTCOME: ${{ steps.publish_zst.outcome }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data_dir = Path("global_metadata/data")
+          path = data_dir / "run-summary.json"
+          report = json.loads(path.read_text()) if path.exists() else {}
+          lanes = {**(report.get("steam") or {}), "hltb": report.get("hltb")}
+          committed = {name: lane["updated"] for name, lane in lanes.items() if lane}
+          publication = {}
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("## Metadata publication\n\n| Asset | Promotion outcome | Published updates by service |\n| --- | --- | --- |\n")
+              for asset, key in (("raw", "RAW_OUTCOME"), ("compressed", "COMPRESSED_OUTCOME")):
+                  outcome = os.environ[key]
+                  published = committed if outcome == "success" else {name: 0 for name in committed}
+                  publication[asset] = {"outcome": outcome, "published_updates": published}
+                  output.write(f"| {asset} | {outcome} | {json.dumps(published)} |\n")
+              output.write("\nOnly successful verified promotions count as published. The two assets are promoted separately; counts must not be added together. Failed or skipped promotions confirm no new published updates.\n")
+          data_dir.mkdir(parents=True, exist_ok=True)
+          (data_dir / "publication-summary.json").write_text(json.dumps(publication, indent=2) + "\n")
+          PY
+
+      - name: Save publication report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: global_metadata/data/publication-summary.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Save recovery artifact after publication failure
         if: ${{ failure() && (steps.publish.outcome == 'failure' || steps.publish_zst.outcome == 'failure') }}

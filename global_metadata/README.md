@@ -130,32 +130,53 @@ lane, without immediate retries. Its cooldown is persisted independently:
 HTTP date) is honoured. The previous `steam_service_retry_after` is also honoured
 for reviews during migration, without blocking details.
 
-An isolated invalid summary/other app-specific acquisition failure records a
+An invalid summary/other app-specific acquisition failure records a
 per-app, per-service retry in `steam_fetch_retries` and continues with other apps.
+Repeated invalid responses and HTTP 401/403 are acquisition failures too: their
+count never makes otherwise valid progress unpublishable. Each app's reviews
+are attempted at most once per run, even if its persistent retry delay expires
+while Store details are still running. Store responses without a valid requested
+entry are errors; only explicit `success=false` in both markets means unavailable.
 Failures never refresh review dates or replace old counts with zero. A validated
 summary containing explicit zero counts is valid. Successful row writes, dirty
 flags and retry cleanup commit in short SQLite transactions. The review success
 counter advances only when the database actually updates a ready row.
 
 `--report PATH` writes separate `details` and `reviews` objects: `limit`,
-`selected`, `attempted`, `updated`, `unavailable`, `skipped`, `errors`,
+`selected`, `attempted`, `completed`, `pending`, `not_attempted`, `updated`,
+`unavailable`, `skipped`, `errors`,
 `deferred`, `budget_exhausted`, `elapsed_seconds`, `fatal_error` and up to ten
 error samples. `selected` counts candidate apps for that lane, `attempted` counts
 app-level acquisition calls (Store can issue two HTTP requests), and reviews
 `updated` counts persisted aggregate summaries, not individual user reviews.
 The same app can appear in both lanes; do not add their counts to infer unique
 games. No eligible work reports zero, not a successful API validation.
+`completed` counts committed successful results (`updated` plus explicit Store
+`unavailable`); `pending` counts selected work not completed, including failures,
+skipped writes and unattempted work. These counters describe this run's selected
+batch, not the entire catalogue backlog or rows still in a previous cooldown.
+The report also includes `hltb`, with `matched`, `no_match`, acquisition errors,
+pending work and any fatal persistence error. HLTB acquisition failures preserve
+cached matches, dirty flags and future retry eligibility. HLTB database writes
+are outside the acquisition-error handler, so transaction failures block release.
 
-A run with isolated acquisition errors, a service cooldown or an exhausted time
-budget reports `status=partial`, `publishable=true` and exits zero. Actions emits
-a visible warning and retains the report; valid progress can pass the unchanged
-SQLite integrity/checksum checks and existing safe release promotion. Failed
-apps remain pending. HTTP 401/403, three consecutive malformed/app-specific
-responses in a lane, and unexpected database/programming errors report
+A run with acquisition errors (regardless of count), a service cooldown or an
+exhausted time budget reports `status=partial`, `publishable=true` and exits zero.
+Actions emits a visible warning and retains the report; valid progress can pass
+the mandatory SQLite integrity/checksum checks and safe release promotion. Failed
+apps remain pending. Corruption, integrity/transaction failures and unexpected
+internal errors that prevent establishing safe publication report
 `status=fatal`, `publishable=false` and exit nonzero, blocking publication.
 Catalogue and uncaught worker failures also fail the job. The existing asset
 promotion/rollback mechanism is retained; raw and compressed asset pairs are
 promoted separately, as before.
+Actions reports acquisition separately from actual publication. The final
+`publication-summary.json` artifact records each asset's promotion outcome and
+published updates per service. A failed/skipped promotion confirms no published
+updates; a successful promotion reports committed updates, without adding raw
+and compressed copies together. A partial acquisition exits zero with an explicit
+warning; the SQLite checkpoint, full integrity check, foreign-key check, checksums
+and verified promotion remain mandatory.
 
 For a small Actions validation, select the branch containing this change, set
 `steam_limit=3`, `steam_reviews_limit=3`, `hltb_limit=0`, and

@@ -21,22 +21,26 @@ def _find_app_entry(payload, appid):
     direct = payload.get(str(appid))
 
     if isinstance(direct, dict):
-        data = direct.get("data") or {}
-
-        if (
-            direct.get("success")
-            and int(data.get("steam_appid", appid)) == appid
-        ):
-            return direct
+        if direct.get("success") is False:
+            return None
+        data = direct.get("data")
+        if direct.get("success") is True and isinstance(data, dict):
+            try:
+                if int(data.get("steam_appid")) == appid:
+                    return direct
+            except (TypeError, ValueError) as error:
+                raise ValueError("Steam Store returned an invalid AppID") from error
 
     for entry in payload.values():
         if not isinstance(entry, dict):
             continue
 
-        if not entry.get("success"):
+        if entry.get("success") is not True:
             continue
 
-        data = entry.get("data") or {}
+        data = entry.get("data")
+        if not isinstance(data, dict):
+            continue
 
         try:
             returned_appid = int(data.get("steam_appid"))
@@ -46,7 +50,7 @@ def _find_app_entry(payload, appid):
         if returned_appid == appid:
             return entry
 
-    return None
+    raise ValueError("Steam Store response has no valid entry for the requested AppID")
 
 
 def _request_store_entry(appid, cc=None):
@@ -99,7 +103,26 @@ def get_store_details(appid):
     if app_data is None:
         return None
 
-    data = app_data.get("data") or {}
+    data = app_data["data"]
+    if not isinstance(data.get("name"), str) or not data["name"].strip():
+        raise ValueError("Steam Store returned a missing/invalid name")
+    for field in ("genres", "categories"):
+        values = data.get(field, [])
+        if not isinstance(values, list) or any(
+                not isinstance(value, dict) or (value.get("description") is not None
+                                                and not isinstance(value["description"], str))
+                for value in values):
+            raise ValueError(f"Steam Store returned invalid {field}")
+    for field in ("developers", "publishers"):
+        values = data.get(field, [])
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError(f"Steam Store returned invalid {field}")
+    release = data.get("release_date")
+    if release is not None and (not isinstance(release, dict)
+                               or (release.get("date") is not None and not isinstance(release["date"], str))):
+        raise ValueError("Steam Store returned an invalid release_date")
+    if "is_free" in data and not isinstance(data["is_free"], bool):
+        raise ValueError("Steam Store returned an invalid is_free flag")
 
     genres = [
         genre.get("description")
