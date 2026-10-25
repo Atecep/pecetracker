@@ -146,6 +146,41 @@ class OfficialReviewTests(unittest.TestCase):
             self.assertEqual(client.get_summary(2)['total_reviews'], 468841)
         self.assertEqual(get.call_count, 2)
 
+    def test_builder_transient_failures_do_not_open_hidden_client_circuit(self):
+        for failure in (requests.Timeout('timeout'), requests.ConnectionError('connection'),
+                        response(status=502)):
+            client = reviews.ReviewClient(interval=2, circuit_on_invalid=False)
+            with self.subTest(failure=failure), patch.object(reviews.requests, 'get',
+                                                           side_effect=[failure, response()]) as get:
+                with self.assertRaises(requests.RequestException):
+                    client.get_summary(1)
+                self.assertEqual(client.get_summary(2)['total_reviews'], 468841)
+                self.assertEqual(get.call_count, 2)
+
+    def test_builder_always_obeys_explicit_service_backoff(self):
+        now = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        retry_date = format_datetime(now + timedelta(hours=2), usegmt=True)
+        for failure in (response(status=429, headers={'Retry-After': '7200'}),
+                        response(status=502, headers={'Retry-After': retry_date}),
+                        response(EMPTY, headers={'Retry-After': '7200'})):
+            client = reviews.ReviewClient(interval=2, circuit_on_invalid=False)
+            with self.subTest(failure=failure), patch.object(reviews.time, 'time', return_value=now.timestamp()), \
+                 patch.object(reviews.requests, 'get', return_value=failure) as get:
+                with self.assertRaises(requests.RequestException):
+                    client.get_summary(1)
+                with self.assertRaises(reviews.ReviewBackoff) as blocked:
+                    client.get_summary(2)
+                self.assertEqual(blocked.exception.retry_after_seconds, 7200)
+                self.assertEqual(get.call_count, 1)
+
+    def test_invalid_retry_after_does_not_turn_app_failure_into_service_failure(self):
+        for value in ('invalid', 'nan', 'inf', '-10'):
+            error = requests.HTTPError(response=response(status=403, headers={'Retry-After': value}))
+            with self.subTest(value=value):
+                self.assertFalse(reviews.is_service_failure(error))
+                self.assertFalse(reviews.is_transient_failure(error))
+                self.assertEqual(reviews.retry_delay(error), 300)
+
 
 class AcquisitionIntegrityTests(unittest.TestCase):
     def setUp(self):

@@ -23,20 +23,25 @@ def retry_delay(error):
     """Honour numeric/HTTP-date Retry-After without shortening server delays."""
     response = getattr(error, "response", None)
     status = getattr(response, "status_code", None)
-    seconds = max(900 if status == 429 else 300,
-                  getattr(error, "retry_after_seconds", 0))
+    return max(900 if status == 429 else 300, _explicit_retry_delay(error) or 0)
+
+
+def _explicit_retry_delay(error):
+    """Return a valid service-directed delay, or None when none was given."""
+    response = getattr(error, "response", None)
+    seconds = getattr(error, "retry_after_seconds", None)
     value = response.headers.get("Retry-After") if response is not None else None
-    if value:
+    if value is not None:
         try:
             delay = float(value)
         except (TypeError, ValueError):
             try:
                 delay = parsedate_to_datetime(value).timestamp() - time.time()
             except (TypeError, ValueError, OverflowError):
-                delay = 0
-        if math.isfinite(delay):
-            seconds = max(seconds, delay)
-    return seconds
+                delay = None
+        if delay is not None and math.isfinite(delay) and delay >= 0:
+            seconds = max(seconds or 0, delay)
+    return seconds if seconds is not None and math.isfinite(seconds) and seconds >= 0 else None
 
 
 class ReviewResponseError(requests.RequestException):
@@ -73,10 +78,15 @@ def parse_summary(payload):
 
 
 class ReviewClient:
-    def __init__(self, interval=ANONYMOUS_INTERVAL_SECONDS, *, circuit_on_invalid=True):
+    def __init__(self, interval=ANONYMOUS_INTERVAL_SECONDS, *, circuit_on_invalid=True,
+                 circuit_on_transient=None):
         # This is a caller policy, not a numeric quota published by Valve.
         self.interval = max(0.0, float(interval))
         self.circuit_on_invalid = circuit_on_invalid
+        # Desktop defaults still stop on every acquisition error. Catalogue
+        # callers disabling this policy own the consecutive-failure breaker.
+        self.circuit_on_transient = (circuit_on_invalid if circuit_on_transient is None
+                                    else circuit_on_transient)
         self._lock = threading.Lock()
         self._last_request = None
         self._retry_at = 0.0
@@ -112,19 +122,34 @@ class ReviewClient:
                     payload = response.json()
                 except ValueError as error:
                     raise ReviewResponseError("Steam reviews returned invalid JSON.", response=response) from error
-                return parse_summary(payload)
+                try:
+                    return parse_summary(payload)
+                except ReviewResponseError as error:
+                    error.response = response
+                    raise
             except requests.RequestException as error:
-                if self.circuit_on_invalid or is_service_failure(error):
+                stop_on_error = (self.circuit_on_transient if is_transient_failure(error)
+                                 else self.circuit_on_invalid)
+                if is_service_failure(error) or stop_on_error:
                     self._retry_at = time.monotonic() + retry_delay(error)
                 raise
 
 
 def is_service_failure(error):
-    """Rate limits, transport failures and upstream outages affect a lane."""
+    """Explicit service backoff must stop a lane immediately."""
+    response = getattr(error, "response", None)
+    return (isinstance(error, ReviewBackoff)
+            or getattr(response, "status_code", None) == 429
+            or _explicit_retry_delay(error) is not None)
+
+
+def is_transient_failure(error):
+    """Transport/5xx failures suggest an outage only when consecutive."""
     response = getattr(error, "response", None)
     status = getattr(response, "status_code", None)
-    return (isinstance(error, ReviewBackoff)
-            or status == 429 or (status is not None and status >= 500)
+    if is_service_failure(error):
+        return False
+    return ((isinstance(status, int) and 500 <= status < 600)
             or (isinstance(error, requests.RequestException)
                 and not isinstance(error, ReviewResponseError) and status is None))
 

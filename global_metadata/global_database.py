@@ -542,10 +542,12 @@ def steam_review_candidates(db_path, limit, *, exclude_appids=()):
 
 
 def save_steam_error(db_path, appid, service, error, seconds):
+    """Defer only this app/service, preserving cached metadata and longer delays."""
     with connect(db_path) as conn:
         conn.execute("""INSERT INTO steam_fetch_retries VALUES (?, ?, ?, ?)
             ON CONFLICT(appid, service) DO UPDATE SET
-              retry_after = excluded.retry_after, last_error = excluded.last_error
+              retry_after = MAX(steam_fetch_retries.retry_after, excluded.retry_after),
+              last_error = excluded.last_error
         """, (int(appid), service, _now().timestamp() + seconds,
               f"{type(error).__name__}: {error}"[:1000]))
 

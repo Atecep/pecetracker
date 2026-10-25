@@ -105,6 +105,8 @@ numeric anonymous quota or reset interval. The global builder uses a configurabl
 2-second minimum between review request starts, based on the limited observations
 in [the throughput audit](steam-throughput-audit.md). This is an operating policy,
 not a discovered quota. The desktop client's default remains 10 seconds.
+Desktop reviews retain their existing circuit breaker on the first acquisition
+failure; only the global builder delegates transient-failure counting to its lane.
 
 Three workers run concurrently: Store details, reviews and the existing HLTB
 worker. `--steam-limit` now budgets details only; `--steam-reviews-limit` budgets
@@ -123,12 +125,21 @@ request can overrun this budget by its bounded HTTP timeout (Store may try two
 markets). HLTB retains its existing behavior and can still determine total run
 time. The selected count is an upper bound, not a promise of completed work.
 
-HTTP 429, transport failures and server errors stop only the affected Steam
-lane, without immediate retries. Its cooldown is persisted independently:
+HTTP 429 or a valid explicit `Retry-After` on an acquisition failure stops only
+the affected Steam lane immediately, without retries. Isolated transport errors
+and HTTP 5xx errors defer only that AppID and processing continues with the usual
+pacing. Consecutive transport/5xx failures across distinct AppIDs stop that lane
+after `--steam-failure-threshold` failures (default 3). A successful acquisition
+resets the counter; app-specific errors also break the transient-failure streak.
+Counters are independent for Store details and reviews. Service cooldown is
+persisted independently:
 `steam_details_retry_after` or `steam_reviews_retry_after`. Backoff is at least
 15 minutes for 429 and 5 minutes otherwise; a longer `Retry-After` (seconds or
 HTTP date) is honoured. The previous `steam_service_retry_after` is also honoured
 for reviews during migration, without blocking details.
+Existing persisted cooldowns are honoured until expiry, including cooldowns
+created by earlier builder versions; their original cause cannot be inferred
+reliably. Isolated failures no longer create these service-wide cooldowns.
 
 An invalid summary/other app-specific acquisition failure records a
 per-app, per-service retry in `steam_fetch_retries` and continues with other apps.
@@ -145,7 +156,8 @@ counter advances only when the database actually updates a ready row.
 `--report PATH` writes separate `details` and `reviews` objects: `limit`,
 `selected`, `attempted`, `completed`, `pending`, `not_attempted`, `updated`,
 `unavailable`, `skipped`, `errors`,
-`deferred`, `budget_exhausted`, `elapsed_seconds`, `fatal_error` and up to ten
+`deferred`, `budget_exhausted`, `elapsed_seconds`, `fatal_error`,
+`consecutive_failures`, `stop_reason` and up to ten
 error samples. `selected` counts candidate apps for that lane, `attempted` counts
 app-level acquisition calls (Store can issue two HTTP requests), and reviews
 `updated` counts persisted aggregate summaries, not individual user reviews.

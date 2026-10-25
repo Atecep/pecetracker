@@ -26,7 +26,9 @@ from constants import (  # noqa: E402
     HLTB_REPEATED_ERROR_BACKOFF_SECONDS,
 )
 import hltb_service  # noqa: E402
-from steam_reviews import ReviewClient, ReviewResponseError, is_service_failure, retry_delay  # noqa: E402
+from steam_reviews import (  # noqa: E402
+    ReviewClient, ReviewResponseError, is_service_failure, is_transient_failure, retry_delay,
+)
 from steam_fetcher import (  # noqa: E402
     get_store_details,
 )
@@ -303,12 +305,13 @@ def sync_catalog(
 
 DEFAULT_REVIEWS_PAUSE = 2.0
 DEFAULT_STEAM_BUDGET_SECONDS = 150 * 60
+DEFAULT_STEAM_FAILURE_THRESHOLD = 3
 
 
 def _lane_report(limit):
     return dict(limit=limit, selected=0, attempted=0, updated=0, unavailable=0,
                 skipped=0, errors=0, deferred=False, budget_exhausted=False,
-                fatal_error=None, error_samples=[])
+                fatal_error=None, error_samples=[], consecutive_failures=0, stop_reason=None)
 
 
 def _finish_lane_report(report, started):
@@ -318,7 +321,7 @@ def _finish_lane_report(report, started):
     report["elapsed_seconds"] = round(time.monotonic() - started, 3)
 
 
-def _record_steam_error(db_path, service, appid, error, report):
+def _record_steam_error(db_path, service, appid, error, report, failure_threshold):
     report["errors"] += 1
     if len(report["error_samples"]) < 10:
         report["error_samples"].append(dict(appid=appid, type=type(error).__name__, message=str(error)))
@@ -326,12 +329,17 @@ def _record_steam_error(db_path, service, appid, error, report):
     # Leave both cached data and successful fetch dates untouched. A per-row
     # delay prevents a permanently bad app from monopolising the next batch.
     save_steam_error(db_path, appid, service, error, retry_delay(error))
-    if is_service_failure(error):
+    service_failure = is_service_failure(error)
+    report["consecutive_failures"] = (report["consecutive_failures"] + 1
+                                      if is_transient_failure(error) else 0)
+    if service_failure or report["consecutive_failures"] >= failure_threshold:
         key = f"steam_{service}_retry_after"
         until = time.time() + retry_delay(error)
         previous = float(get_state(db_path, key, "0"))
         set_state(db_path, key, max(previous, until))
         report["deferred"] = True
+        report["stop_reason"] = ("service_cooldown" if service_failure
+                                 else "consecutive_transient_failures")
         print(f"[steam-{service}] Service cooldown; other workers continue.", flush=True)
         return True
     return False
@@ -345,11 +353,13 @@ def _lane_cooling_down(db_path, service, report):
         until = max(until, float(get_state(db_path, "steam_service_retry_after", "0")))
     if time.time() < until:
         report["deferred"] = True
+        report["stop_reason"] = "persisted_cooldown"
         return True
     return False
 
 
-def _update_details(db_path, report, pause_seconds, deadline, done):
+def _update_details(db_path, report, pause_seconds, deadline, done,
+                    failure_threshold=DEFAULT_STEAM_FAILURE_THRESHOLD):
     started = time.monotonic()
     try:
         games = steam_details_candidates(db_path, report["limit"])
@@ -371,10 +381,11 @@ def _update_details(db_path, report, pause_seconds, deadline, done):
             try:
                 details = get_store_details(appid)
             except (requests.RequestException, ValueError) as error:
-                if _record_steam_error(db_path, "details", appid, error, report):
+                if _record_steam_error(db_path, "details", appid, error, report, failure_threshold):
                     break
                 continue
             # DB/programming failures propagate; they are not acquisition errors.
+            report["consecutive_failures"] = 0
             if details is None:
                 save_steam_unavailable(db_path, appid)
                 report["unavailable"] += 1
@@ -388,9 +399,12 @@ def _update_details(db_path, report, pause_seconds, deadline, done):
         done.set()
 
 
-def _update_reviews(db_path, report, interval, deadline, details_done):
+def _update_reviews(db_path, report, interval, deadline, details_done,
+                    failure_threshold=DEFAULT_STEAM_FAILURE_THRESHOLD):
     started = time.monotonic()
-    client = ReviewClient(interval=interval, circuit_on_invalid=False)
+    # The lane owns the consecutive-failure breaker; the client still enforces
+    # request spacing and unconditional rate-limit/Retry-After backoff.
+    client = ReviewClient(interval=interval, circuit_on_invalid=False, circuit_on_transient=False)
     attempted_appids = set()
     try:
         if report["limit"] <= 0:
@@ -423,9 +437,10 @@ def _update_reviews(db_path, report, interval, deadline, details_done):
                     if summary is None:
                         raise ReviewResponseError("Steam reviews summary is unavailable")
                 except (requests.RequestException, ValueError) as error:
-                    if _record_steam_error(db_path, "reviews", appid, error, report):
+                    if _record_steam_error(db_path, "reviews", appid, error, report, failure_threshold):
                         return
                     continue
+                report["consecutive_failures"] = 0
                 if save_steam_reviews(db_path, appid, summary):
                     report["updated"] += 1
                 else:
@@ -438,16 +453,19 @@ def _update_reviews(db_path, report, interval, deadline, details_done):
 
 def update_steam(db_path, *, limit, pause_seconds, reviews_limit=None,
                  reviews_pause_seconds=DEFAULT_REVIEWS_PAUSE,
-                 budget_seconds=DEFAULT_STEAM_BUDGET_SECONDS):
+                 budget_seconds=DEFAULT_STEAM_BUDGET_SECONDS,
+                 failure_threshold=DEFAULT_STEAM_FAILURE_THRESHOLD):
     """Run independent Store and reviews lanes, each with its own budget."""
+    if type(failure_threshold) is not int or failure_threshold < 1:
+        raise ValueError("Steam failure threshold must be a positive integer")
     details = _lane_report(limit)
     reviews = _lane_report(limit if reviews_limit is None else reviews_limit)
     done = threading.Event()
     deadline = time.monotonic() + budget_seconds
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="steam") as executor:
         futures = (
-            (details, executor.submit(_update_details, db_path, details, pause_seconds, deadline, done)),
-            (reviews, executor.submit(_update_reviews, db_path, reviews, reviews_pause_seconds, deadline, done)),
+            (details, executor.submit(_update_details, db_path, details, pause_seconds, deadline, done, failure_threshold)),
+            (reviews, executor.submit(_update_reviews, db_path, reviews, reviews_pause_seconds, deadline, done, failure_threshold)),
         )
         for lane, future in futures:
             try:
@@ -667,12 +685,16 @@ def parse_args():
                         help="Minimum seconds between anonymous review request starts")
     parser.add_argument("--steam-budget-seconds", type=float, default=DEFAULT_STEAM_BUDGET_SECONDS,
                         help="Time budget per Steam lane; reserves time for publication")
+    parser.add_argument("--steam-failure-threshold", type=int, default=DEFAULT_STEAM_FAILURE_THRESHOLD,
+                        help="Consecutive transport/5xx failures before stopping a Steam lane")
     parser.add_argument("--report", help="Write acquisition counters/status as JSON for CI diagnostics")
 
     args = parser.parse_args()
     limits = (args.steam_limit, args.hltb_limit, args.steam_reviews_limit)
     if any(n is not None and n < 0 for n in limits):
         parser.error("Batch limits must be non-negative")
+    if args.steam_failure_threshold < 1:
+        parser.error("Steam failure threshold must be a positive integer")
     if any(not math.isfinite(n) or n < 0 for n in
            (args.steam_pause, args.steam_reviews_pause, args.steam_budget_seconds)):
         parser.error("Steam intervals and time budgets must be finite and non-negative")
@@ -726,6 +748,7 @@ def main():
                 reviews_limit=args.steam_reviews_limit,
                 reviews_pause_seconds=args.steam_reviews_pause,
                 budget_seconds=args.steam_budget_seconds,
+                failure_threshold=args.steam_failure_threshold,
             )
             hltb_future = executor.submit(
                 update_hltb,
@@ -747,6 +770,7 @@ def main():
             reviews_limit=args.steam_reviews_limit,
             reviews_pause_seconds=args.steam_reviews_pause,
             budget_seconds=args.steam_budget_seconds,
+            failure_threshold=args.steam_failure_threshold,
         )
 
     elif run_hltb:

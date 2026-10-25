@@ -289,11 +289,13 @@ class SteamSchedulingTests(unittest.TestCase):
         self.assertFalse(builder.steam_run_failed(report))
         self.assertEqual((report['reviews']['errors'], report['reviews']['updated']), (3, 1))
 
-    def test_transport_and_http_errors_defer_only_the_affected_lane_and_publish_progress(self):
+    def test_explicit_service_backoff_defers_only_the_affected_lane_and_publishes_progress(self):
         self.ready([1, 2, 3, 4])
         for service in ('details', 'reviews'):
-            for failure in (requests.Timeout('timeout'), requests.ConnectionError('connection'),
-                            *[requests.HTTPError(response=self.http_response(code)) for code in (429, 500, 503)]):
+            delayed = self.http_response(503)
+            delayed.headers['Retry-After'] = '7200'
+            for failure in (requests.HTTPError(response=self.http_response(429)),
+                            requests.HTTPError(response=delayed)):
                 with self.subTest(service=service, failure=failure):
                     with db.connect(self.path) as conn:
                         conn.execute('DELETE FROM steam_fetch_retries')
@@ -312,6 +314,181 @@ class SteamSchedulingTests(unittest.TestCase):
                     self.assertTrue(lane['deferred'])
                     other = report['reviews' if service == 'details' else 'details']
                     self.assertEqual(other['updated'], 4)
+
+    def test_isolated_review_failures_continue_with_real_client_and_pacing(self):
+        self.ready(range(1, 5))
+        valid = json.loads((Path(__file__).parent / 'fixtures/steam_reviews_portal2.json').read_text())
+        invalid = self.http_response(200)
+        invalid._content = b'{"response":{}}'
+        bad_json = self.http_response(200)
+        bad_json._content = b'<html>invalid</html>'
+        for failure in (requests.Timeout('timeout'), requests.ConnectionError('connection'),
+                        self.http_response(502), invalid, bad_json):
+            with self.subTest(failure=failure):
+                with db.connect(self.path) as conn:
+                    conn.execute('DELETE FROM steam_fetch_retries')
+                    conn.execute("UPDATE steam_metadata SET total_reviews=17,reviews_fetched_at='2020-01-01'")
+                    before = tuple(conn.execute('SELECT * FROM steam_metadata WHERE appid=1').fetchone())
+                clock = [100.0]
+                starts = []
+
+                def get(*args, **kwargs):
+                    starts.append((json.loads(kwargs['params']['input_json'])['appid'], clock[0]))
+                    if len(starts) == 1:
+                        if isinstance(failure, Exception):
+                            raise failure
+                        return failure
+                    result = self.http_response(200)
+                    result._content = json.dumps(valid).encode()
+                    return result
+
+                with patch.object(steam_reviews.requests, 'get', side_effect=get), \
+                     patch.object(steam_reviews.time, 'monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(steam_reviews.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0] + n)), \
+                     redirect_stdout(io.StringIO()):
+                    report = builder.update_steam(self.path, limit=0, pause_seconds=0, reviews_limit=4)
+                lane = report['reviews']
+                self.assertEqual(starts, [(1, 100), (2, 102), (3, 104), (4, 106)])
+                self.assertEqual((lane['updated'], lane['errors'], lane['pending']), (3, 1, 1))
+                self.assertFalse(lane['deferred'])
+                self.assertIsNone(lane['fatal_error'])
+                self.assertIsNone(db.get_state(self.path, 'steam_reviews_retry_after'))
+                self.assertIsNone(db.get_state(self.path, 'steam_service_retry_after'))
+                with db.connect(self.path) as conn:
+                    self.assertEqual(tuple(conn.execute('SELECT * FROM steam_metadata WHERE appid=1').fetchone()), before)
+                    self.assertEqual(conn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+                    self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
+                with patch.object(steam_reviews.requests, 'get') as fetch:
+                    self.assertEqual(self.run_batch(limit=0, reviews_limit=4)['reviews']['attempted'], 0)
+                    fetch.assert_not_called()
+                with patch.object(db, '_now', return_value=db._now() + timedelta(seconds=301)), \
+                     patch.object(steam_reviews.requests, 'get', return_value=self.review_response(valid)) as fetch:
+                    resumed = self.run_batch(limit=0, reviews_limit=4)
+                self.assertEqual((fetch.call_count, resumed['reviews']['updated']), (1, 1))
+                self.assertEqual(db.steam_review_candidates(self.path, 10), [])
+
+    def test_consecutive_transient_failures_stop_only_the_affected_lane(self):
+        self.ready(range(1, 5))
+        for service in ('details', 'reviews'):
+            with self.subTest(service=service):
+                with db.connect(self.path) as conn:
+                    conn.execute('DELETE FROM steam_fetch_retries')
+                    conn.execute('DELETE FROM updater_state')
+                    conn.execute('UPDATE steam_catalog SET steam_dirty=1')
+                    conn.execute('UPDATE steam_metadata SET reviews_fetched_at=NULL')
+                failures = [requests.Timeout('timeout'), requests.ConnectionError('connection'),
+                            requests.HTTPError(response=self.http_response(502))]
+                with patch.object(builder, 'get_store_details',
+                                  side_effect=failures if service == 'details' else lambda n: {'appid': n}) as store, \
+                     patch.object(builder.ReviewClient, 'get_summary',
+                                  side_effect=failures if service == 'reviews' else None, return_value=SUMMARY) as reviews:
+                    report = self.run_batch()
+                    self.assertEqual((store if service == 'details' else reviews).call_count, 3)
+                    blocked = self.run_batch()
+                lane = report[service]
+                self.assertEqual((lane['errors'], lane['consecutive_failures'], lane['not_attempted']), (3, 3, 1))
+                self.assertEqual(lane['stop_reason'], 'consecutive_transient_failures')
+                self.assertTrue(lane['deferred'])
+                self.assertEqual(blocked[service]['attempted'], 0)
+                self.assertEqual(blocked[service]['stop_reason'], 'persisted_cooldown')
+                other = 'reviews' if service == 'details' else 'details'
+                self.assertEqual(report[other]['updated'], 4)
+                self.assertIsNone(db.get_state(self.path, f'steam_{other}_retry_after'))
+
+    def test_real_client_service_delay_survives_runs_while_details_continue(self):
+        self.ready(range(1, 5))
+        valid = json.loads((Path(__file__).parent / 'fixtures/steam_reviews_portal2.json').read_text())
+        now = db._now()
+        for status in (429, 502):
+            with self.subTest(status=status):
+                with db.connect(self.path) as conn:
+                    conn.execute('DELETE FROM steam_fetch_retries')
+                    conn.execute('DELETE FROM updater_state')
+                    conn.execute('UPDATE steam_catalog SET steam_dirty=1')
+                    conn.execute('UPDATE steam_metadata SET reviews_fetched_at=NULL')
+                limited = self.http_response(status)
+                limited.headers['Retry-After'] = '7200'
+                with patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), \
+                     patch.object(steam_reviews.requests, 'get', return_value=limited) as fetch, \
+                     patch.object(builder.time, 'time', return_value=now.timestamp()), \
+                     patch.object(db, '_now', return_value=now):
+                    first = self.run_batch()
+                    second = self.run_batch()
+                    self.assertEqual(fetch.call_count, 1)
+                self.assertEqual(first['details']['updated'], 4)
+                self.assertEqual(first['reviews']['stop_reason'], 'service_cooldown')
+                self.assertTrue(second['reviews']['deferred'])
+                self.assertEqual(float(db.get_state(self.path, 'steam_reviews_retry_after')), now.timestamp() + 7200)
+                db.upsert_catalog(self.path, [{'appid': 5, 'name': 'New game'}])
+                with patch.object(builder, 'get_store_details', side_effect=lambda n: {'appid': n}), \
+                     patch.object(steam_reviews.requests, 'get', return_value=self.review_response(valid)) as fetch, \
+                     patch.object(builder.time, 'time', return_value=now.timestamp() + 7199), \
+                     patch.object(db, '_now', return_value=now + timedelta(seconds=7199)):
+                    blocked = self.run_batch()
+                    fetch.assert_not_called()
+                self.assertEqual(blocked['details']['updated'], 1)
+                self.assertTrue(blocked['reviews']['deferred'])
+                with patch.object(steam_reviews.requests, 'get', return_value=self.review_response(valid)) as fetch, \
+                     patch.object(builder.time, 'time', return_value=now.timestamp() + 7201), \
+                     patch.object(db, '_now', return_value=now + timedelta(seconds=7201)):
+                    resumed = self.run_batch(limit=0, reviews_limit=5)
+                self.assertEqual((fetch.call_count, resumed['reviews']['updated']), (5, 5))
+                self.assertFalse(resumed['reviews']['deferred'])
+                with db.connect(self.path) as conn:
+                    conn.execute('DELETE FROM steam_catalog WHERE appid=5')
+
+    def test_success_and_app_errors_break_transient_failure_streaks_in_each_lane(self):
+        self.ready(range(1, 5))
+        for service in ('details', 'reviews'):
+            for middle_error in (False, True):
+                with self.subTest(service=service, middle_error=middle_error):
+                    with db.connect(self.path) as conn:
+                        conn.execute('DELETE FROM steam_fetch_retries')
+                        conn.execute('DELETE FROM updater_state')
+                        conn.execute('UPDATE steam_catalog SET steam_dirty=1')
+                        conn.execute('UPDATE steam_metadata SET reviews_fetched_at=NULL')
+                    success = SUMMARY if service == 'reviews' else {'appid': 2}
+                    sequence = [requests.Timeout('timeout'), ValueError('invalid app') if middle_error else success,
+                                requests.HTTPError(response=self.http_response(502)),
+                                SUMMARY if service == 'reviews' else {'appid': 4}]
+                    with patch.object(builder, 'get_store_details',
+                                      side_effect=sequence if service == 'details' else lambda n: {'appid': n}), \
+                         patch.object(builder.ReviewClient, 'get_summary',
+                                      side_effect=sequence if service == 'reviews' else None, return_value=SUMMARY):
+                        report = self.run_batch(failure_threshold=2)
+                    self.assertEqual(report[service]['attempted'], 4)
+                    self.assertEqual(report[service]['updated'], 1 if middle_error else 2)
+                    self.assertEqual(report[service]['consecutive_failures'], 0)
+                    self.assertFalse(report[service]['deferred'])
+
+    def test_retry_delay_is_not_shortened_by_another_app_error(self):
+        self.ready([1])
+        db.save_steam_error(self.path, 1, 'reviews', ValueError('long delay'), 7200)
+        with db.connect(self.path) as conn:
+            until = conn.execute('SELECT retry_after FROM steam_fetch_retries').fetchone()[0]
+            before = tuple(conn.execute('SELECT * FROM steam_metadata').fetchone())
+        db.save_steam_error(self.path, 1, 'reviews', ValueError('short delay'), 300)
+        with db.connect(self.path) as conn:
+            self.assertEqual(conn.execute('SELECT retry_after FROM steam_fetch_retries').fetchone()[0], until)
+            self.assertEqual(tuple(conn.execute('SELECT * FROM steam_metadata').fetchone()), before)
+        self.assertEqual([r['appid'] for r in db.steam_review_candidates(self.path, 10)], [])
+
+    def test_failure_threshold_is_configurable_and_cli_rejects_zero(self):
+        with patch.object(builder, 'get_store_details', side_effect=requests.Timeout('timeout')) as fetch:
+            report = self.run_batch(reviews_limit=0, failure_threshold=2)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(report['details']['consecutive_failures'], 2)
+        with patch.object(sys, 'argv', ['builder', '--steam-failure-threshold', '2']):
+            self.assertEqual(builder.parse_args().steam_failure_threshold, 2)
+        with patch.object(sys, 'argv', ['builder', '--steam-failure-threshold', '0']), \
+             redirect_stdout(io.StringIO()), patch('sys.stderr', new=io.StringIO()), self.assertRaises(SystemExit):
+            builder.parse_args()
+
+    @staticmethod
+    def review_response(payload):
+        result = SteamSchedulingTests.http_response(200)
+        result._content = json.dumps(payload).encode()
+        return result
 
     @staticmethod
     def http_response(code):
