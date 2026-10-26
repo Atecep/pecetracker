@@ -1,16 +1,44 @@
 """Execute the Actions diagnostics and integrity gates against disposable data."""
+from contextlib import closing, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/update-global-metadata.yml'
+
+
+def workflow_bash():
+    """Resolve native Bash explicitly; Windows' PATH may prefer the WSL launcher."""
+    if sys.platform == 'win32':
+        roots = []
+        git = shutil.which('git')
+        if git:
+            # Git for Windows exposes git.exe in cmd, bin or mingw64/bin.
+            roots.extend(Path(git).resolve().parents[:3])
+        for variable in ('ProgramW6432', 'ProgramFiles', 'ProgramFiles(x86)'):
+            if os.environ.get(variable):
+                roots.append(Path(os.environ[variable]) / 'Git')
+        for root in roots:
+            for relative in ('bin/bash.exe', 'usr/bin/bash.exe'):
+                candidate = root / relative
+                if candidate.is_file():
+                    return str(candidate)
+        raise FileNotFoundError('Git Bash is required to validate workflow syntax on Windows; '
+                                'install Git for Windows (WSL bash.exe is not used).')
+    bash = shutil.which('bash')
+    if not bash:
+        raise FileNotFoundError('Bash is required to validate workflow syntax.')
+    return bash
 
 
 def run_blocks():
@@ -97,21 +125,96 @@ class GlobalWorkflowTests(unittest.TestCase):
                                      else dict(details=0, reviews=0))
 
     def test_checkpoint_rejects_foreign_key_corruption(self):
-        with sqlite3.connect(self.data / 'global_metadata.db') as connection:
+        with closing(sqlite3.connect(self.data / 'global_metadata.db')) as connection:
             connection.executescript('''
                 CREATE TABLE parent (id INTEGER PRIMARY KEY);
                 CREATE TABLE child (id INTEGER REFERENCES parent(id));
                 INSERT INTO child VALUES (99);
             ''')
+        # Keep the reference alive: transaction exit alone would pass on Linux
+        # but leave the database open and block TemporaryDirectory on Windows.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute('SELECT 1')
         result = self.run_python_step('Checkpoint and verify SQLite database')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('foreign keys', result.stderr)
 
+        # Execute the actual gate with retained connections, so Linux also
+        # detects leaks on rejection, success and a PRAGMA exception.
+        block = dict(run_blocks())['Checkpoint and verify SQLite database']
+        code = block.split("python - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        connect = sqlite3.connect
+        connections = []
+
+        class FailingConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if sql == 'PRAGMA integrity_check':
+                    raise sqlite3.OperationalError('injected integrity query failure')
+                return super().execute(sql, *args, **kwargs)
+
+        for outcome in ('corrupt', 'healthy', 'query_error'):
+            with self.subTest(checkpoint=outcome):
+                if outcome == 'healthy':
+                    with closing(connect(self.data / 'global_metadata.db')) as repair:
+                        repair.execute('DELETE FROM child')
+                        repair.commit()
+
+                def tracked_connect(path):
+                    self.assertEqual(path, Path('global_metadata/data/global_metadata.db'))
+                    conn = connect(self.data / 'global_metadata.db',
+                                   factory=FailingConnection if outcome == 'query_error' else sqlite3.Connection)
+                    connections.append(conn)
+                    return conn
+
+                with patch.object(sqlite3, 'connect', side_effect=tracked_connect), redirect_stdout(io.StringIO()):
+                    if outcome == 'corrupt':
+                        with self.assertRaisesRegex(SystemExit, 'foreign keys'):
+                            exec(compile(code, '<workflow checkpoint>', 'exec'), {})
+                    elif outcome == 'query_error':
+                        with self.assertRaisesRegex(sqlite3.OperationalError, 'injected integrity query failure'):
+                            exec(compile(code, '<workflow checkpoint>', 'exec'), {})
+                    else:
+                        exec(compile(code, '<workflow checkpoint>', 'exec'), {})
+                self.assertEqual(len(connections), 1)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connections.pop().execute('SELECT 1')
+
     def test_workflow_shells_parse_and_scheduled_capacity_is_unchanged(self):
+        bash = workflow_bash()
         for name, script in run_blocks():
             with self.subTest(step=name):
-                result = subprocess.run(['bash', '-n'], input=script, text=True, capture_output=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
+                # Binary stdin preserves LF on Windows instead of translating
+                # it to CRLF before Git Bash parses the workflow script.
+                result = subprocess.run([bash, '--noprofile', '--norc', '-n'], input=script.encode('utf-8'),
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 0,
+                                 f'{bash}: stdout={result.stdout!r}; stderr={result.stderr!r}')
+        invalid = subprocess.run([bash, '--noprofile', '--norc', '-n'],
+                                 input=b'if then\n', capture_output=True)
+        self.assertNotEqual(invalid.returncode, 0, f'{bash} accepted invalid Bash syntax')
+
+        # Reproduce a Windows PATH with WSL first, independently of host OS.
+        git_root = self.root / 'Program Files' / 'Git'
+        git_bash = git_root / 'bin' / 'bash.exe'
+        git_bash.parent.mkdir(parents=True)
+        git_bash.touch()
+        wsl_bash = self.root / 'Windows' / 'System32' / 'bash.exe'
+        wsl_bash.parent.mkdir(parents=True)
+        wsl_bash.touch()
+        for directory in ('cmd', 'bin', 'mingw64/bin'):
+            with self.subTest(git_directory=directory):
+                git = git_root / directory / 'git.exe'
+                git.parent.mkdir(parents=True, exist_ok=True)
+                git.touch()
+                with patch.object(sys, 'platform', 'win32'), \
+                     patch.object(shutil, 'which', side_effect=lambda name: str(git) if name == 'git' else str(wsl_bash)):
+                    self.assertEqual(workflow_bash(), str(git_bash))
+        with patch.object(sys, 'platform', 'win32'), patch.object(shutil, 'which', return_value=None), \
+             patch.dict(os.environ, {'ProgramFiles': str(self.root / 'Program Files')}, clear=True):
+            self.assertEqual(workflow_bash(), str(git_bash))
+        with patch.object(sys, 'platform', 'win32'), patch.object(shutil, 'which', return_value=str(wsl_bash)), \
+             patch.dict(os.environ, {}, clear=True), self.assertRaises(FileNotFoundError):
+            workflow_bash()
         workflow = WORKFLOW.read_text()
         for setting in ('STEAM_LIMIT=2500', 'STEAM_REVIEWS_LIMIT=2500',
                         '--steam-reviews-pause 2', 'HLTB_LIMIT=1300', '--hltb-pause 1.9',

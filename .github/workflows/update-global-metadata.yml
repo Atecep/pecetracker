@@ -161,12 +161,13 @@ jobs:
       - name: Checkpoint and verify SQLite database
         run: |
           python - <<'PY'
+          from contextlib import closing
           import sqlite3
           from pathlib import Path
 
           db = Path("global_metadata/data/global_metadata.db")
 
-          with sqlite3.connect(db) as conn:
+          with closing(sqlite3.connect(db)) as conn:
               checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
               result = [row[0] for row in conn.execute("PRAGMA integrity_check")]
               foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
