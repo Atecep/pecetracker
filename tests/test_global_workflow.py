@@ -67,6 +67,17 @@ class GlobalWorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('publication is blocked', result.stderr)
 
+    def test_review_selection_counters_are_visible_in_acquisition_summary(self):
+        self.report['steam']['reviews'].update(eligible=120, cooldown_excluded=3,
+                                               min_age_excluded=10, individual_errors=1,
+                                               updated=99, unused_capacity=0)
+        self.write_report()
+        result = self.run_python_step('Report acquisition health')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self.summary.read_text()
+        self.assertIn('Reviews eligible | Excluded by cooldown', summary)
+        self.assertIn('| 120 | 3 | 10 | 1 | 99 | 0 |', summary)
+
     def test_missing_successful_acquisition_report_blocks_publication(self):
         (self.data / 'run-summary.json').unlink()
         self.assertNotEqual(self.run_python_step('Report acquisition health').returncode, 0)

@@ -23,6 +23,10 @@ STEAM_UNAVAILABLE_RETRY_DAYS = 30
 # without calling /api/appdetails again.
 GLOBAL_STEAM_DETAILS_MAX_AGE_DAYS = 365
 GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS = 90
+# Fill spare review capacity from the oldest still-valid summaries without
+# refreshing the same games on successive twice-daily runs.
+GLOBAL_STEAM_REVIEWS_MIN_AGE_DAYS = 7
+GLOBAL_STEAM_REVIEWS_ERROR_COOLDOWN_SECONDS = 48 * 60 * 60
 
 # Global-only HLTB no-match refresh policy. The desktop app retains its
 # separate 30-day HLTB_NO_MATCH_CACHE_DAYS setting from constants.py.
@@ -523,7 +527,7 @@ def steam_details_candidates(db_path, limit):
 
 
 def steam_review_candidates(db_path, limit, *, exclude_appids=()):
-    """Oldest/missing summaries first, independently of catalogue dirtiness."""
+    """Missing/expired first, then oldest valid summaries at least 7 days old."""
     excluded = tuple(int(appid) for appid in exclude_appids)
     exclusion = "AND c.appid NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
     with connect(db_path) as conn:
@@ -531,14 +535,40 @@ def steam_review_candidates(db_path, limit, *, exclude_appids=()):
             SELECT c.appid, c.name FROM steam_catalog c
             JOIN steam_metadata s ON s.appid = c.appid
             WHERE s.state = 'ready'
-              AND COALESCE(s.reviews_fetched_at, '') < ?
+              AND COALESCE(s.reviews_fetched_at, '') <= ?
               AND NOT EXISTS (SELECT 1 FROM steam_fetch_retries r
                 WHERE r.appid = c.appid AND r.service = 'reviews' AND r.retry_after > ?)
               {exclusion}
             ORDER BY COALESCE(s.reviews_fetched_at, ''), c.appid
             LIMIT ?
-        """, (_cutoff_iso(GLOBAL_STEAM_REVIEWS_MAX_AGE_DAYS), _now().timestamp(), *excluded, int(limit))).fetchall()
+        """, (_cutoff_iso(GLOBAL_STEAM_REVIEWS_MIN_AGE_DAYS), _now().timestamp(), *excluded, int(limit))).fetchall()
     return [dict(row) for row in rows]
+
+
+def steam_review_selection_counts(db_path, *, exclude_appids=()):
+    """Count the selection pool, independently of the current request budget.
+
+    Cooldowns take precedence over minimum age, so the counts do not overlap.
+    Excluding attempted apps lets the worker account for newly ready details
+    without counting its own successful writes or new failures a second time.
+    """
+    now = _now()
+    minimum_age = (now - timedelta(days=GLOBAL_STEAM_REVIEWS_MIN_AGE_DAYS)).isoformat(timespec="seconds")
+    excluded = tuple(int(appid) for appid in exclude_appids)
+    exclusion = "AND s.appid NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
+    with connect(db_path) as conn:
+        row = conn.execute(f"""
+            SELECT
+                COUNT(CASE WHEN COALESCE(r.retry_after, 0) <= ?
+                    AND COALESCE(s.reviews_fetched_at, '') <= ? THEN 1 END) AS eligible,
+                COUNT(CASE WHEN r.retry_after > ? THEN 1 END) AS cooldown_excluded,
+                COUNT(CASE WHEN COALESCE(r.retry_after, 0) <= ?
+                    AND COALESCE(s.reviews_fetched_at, '') > ? THEN 1 END) AS min_age_excluded
+            FROM steam_metadata s
+            LEFT JOIN steam_fetch_retries r ON r.appid = s.appid AND r.service = 'reviews'
+            WHERE s.state = 'ready' {exclusion}
+        """, (now.timestamp(), minimum_age, now.timestamp(), now.timestamp(), minimum_age, *excluded)).fetchone()
+    return dict(row)
 
 
 def save_steam_error(db_path, appid, service, error, seconds):

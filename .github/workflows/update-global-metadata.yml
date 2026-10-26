@@ -133,6 +133,11 @@ jobs:
                       if lane:
                           values = [lane[key] for key in ("selected", "attempted", "completed", "errors", "pending", "updated")]
                           output.write("| " + name + " | " + " | ".join(map(str, values)) + " |\n")
+                  reviews = lanes.get("reviews") or {}
+                  if "eligible" in reviews:
+                      output.write("\n| Reviews eligible | Excluded by cooldown | Below minimum age | Individual errors | Updated | Unused request capacity |\n| ---: | ---: | ---: | ---: | ---: | ---: |\n")
+                      values = [reviews[key] for key in ("eligible", "cooldown_excluded", "min_age_excluded", "individual_errors", "updated", "unused_capacity")]
+                      output.write("| " + " | ".join(map(str, values)) + " |\n")
                   output.write("\nPending includes failed requests and selected work not committed. Counts are per service, not unique games. Local commits are published only after verified asset promotion.\n\n```json\n" + json.dumps(report, indent=2) + "\n```\n")
               if not report["publishable"]:
                   raise SystemExit("::error::Fatal acquisition error; publication is blocked. Inspect the report.")

@@ -115,6 +115,12 @@ existing 2-second pause between games. Reviews can process already cached detail
 while new details are being acquired and pick up new ready rows as they arrive.
 They select missing/oldest summaries independently of catalogue dirtiness; a
 catalogue change alone no longer forces a fresh review summary to be fetched.
+Missing summaries and summaries beyond the 90-day TTL come first. If fewer are
+due than the review budget, the remaining capacity goes to the oldest still-valid
+summaries, provided their last successful review fetch was at least 7 days ago
+(`GLOBAL_STEAM_REVIEWS_MIN_AGE_DAYS`). This oldest-first rotation fills spare
+capacity without fetching the same recently updated games on successive runs.
+The minimum age is global-only; desktop cache rules are unchanged.
 Review-only work does not consume the details budget. Disabling either Steam
 lane does not disable the other. HLTB limits, cadence and matching are unchanged.
 
@@ -143,6 +149,12 @@ reliably. Isolated failures no longer create these service-wide cooldowns.
 
 An invalid summary/other app-specific acquisition failure records a
 per-app, per-service retry in `steam_fetch_retries` and continues with other apps.
+For reviews, these individual errors (including HTTP 401/403/404 without service
+backoff) persist a 48-hour cooldown in SQLite. The AppID is excluded from review
+selection until that deadline, then becomes eligible again; Store details for
+that AppID remain independent. This does not replace the service-wide policy
+for HTTP 429, explicit `Retry-After`, or consecutive transport/5xx failures.
+Isolated transport/5xx errors retain their existing shorter per-app backoff.
 Repeated invalid responses and HTTP 401/403 are acquisition failures too: their
 count never makes otherwise valid progress unpublishable. Each app's reviews
 are attempted at most once per run, even if its persistent retry delay expires
@@ -167,6 +179,18 @@ games. No eligible work reports zero, not a successful API validation.
 `unavailable`); `pending` counts selected work not completed, including failures,
 skipped writes and unattempted work. These counters describe this run's selected
 batch, not the entire catalogue backlog or rows still in a previous cooldown.
+Reviews additionally report `eligible`, `cooldown_excluded`, `min_age_excluded`,
+`individual_errors` and `unused_capacity`; successful writes remain `updated`.
+Selection counts use initial/final snapshots of ready rows, including concurrent
+Store arrivals, rather than summing repeated polls. `eligible` includes attempted
+apps and the remaining pool before applying the request budget or global service
+cooldown. Exclusion counts record rows blocked at those snapshots, omitting apps
+already attempted at the time of each snapshot. `individual_errors` excludes
+service and transport/5xx failures. `unused_capacity` is the request limit minus
+attempted apps: a failed request consumes one slot, while a cooldown exclusion
+consumes none. Games below the minimum age are never fetched just to fill a batch.
+The Actions acquisition summary shows these review counters separately; release
+promotion and publication accounting are unchanged.
 The report also includes `hltb`, with `matched`, `no_match`, acquisition errors,
 pending work and any fatal persistence error. HLTB acquisition failures preserve
 cached matches, dirty flags and future retry eligibility. HLTB database writes

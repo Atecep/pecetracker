@@ -100,7 +100,7 @@ class SteamSchedulingTests(unittest.TestCase):
             row = conn.execute('SELECT total_reviews,reviews_fetched_at FROM steam_metadata WHERE appid=1').fetchone()
         self.assertEqual(tuple(row), (10, '2020-01-01'))
         self.assertEqual(db.steam_review_candidates(self.path, 10), [])
-        with patch.object(db, '_now', return_value=db._now() + timedelta(seconds=301)):
+        with patch.object(db, '_now', return_value=db._now() + timedelta(hours=48, seconds=1)):
             self.assertEqual([r['appid'] for r in db.steam_review_candidates(self.path, 10)], [1])
         with db.connect(self.path) as conn:
             conn.execute('UPDATE steam_fetch_retries SET retry_after=0')
@@ -244,7 +244,7 @@ class SteamSchedulingTests(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT count(*) FROM steam_fetch_retries').fetchone()[0], 800)
             self.assertEqual(conn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
-        with patch.object(db, '_now', return_value=db._now() + timedelta(seconds=601)):
+        with patch.object(db, '_now', return_value=db._now() + timedelta(hours=48, seconds=1)):
             for candidates in (db.steam_details_candidates, db.steam_review_candidates):
                 self.assertEqual([r['appid'] for r in candidates(self.path, 2500)], list(range(1, 401)))
 
@@ -361,7 +361,8 @@ class SteamSchedulingTests(unittest.TestCase):
                 with patch.object(steam_reviews.requests, 'get') as fetch:
                     self.assertEqual(self.run_batch(limit=0, reviews_limit=4)['reviews']['attempted'], 0)
                     fetch.assert_not_called()
-                with patch.object(db, '_now', return_value=db._now() + timedelta(seconds=301)), \
+                delay = 48 * 3600 if isinstance(failure, requests.Response) and failure.status_code == 200 else 300
+                with patch.object(db, '_now', return_value=db._now() + timedelta(seconds=delay + 1)), \
                      patch.object(steam_reviews.requests, 'get', return_value=self.review_response(valid)) as fetch:
                     resumed = self.run_batch(limit=0, reviews_limit=4)
                 self.assertEqual((fetch.call_count, resumed['reviews']['updated']), (1, 1))

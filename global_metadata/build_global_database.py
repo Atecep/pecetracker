@@ -34,6 +34,7 @@ from steam_fetcher import (  # noqa: E402
 )
 
 from global_database import (  # noqa: E402
+    GLOBAL_STEAM_REVIEWS_ERROR_COOLDOWN_SECONDS,
     get_state,
     hltb_candidates,
     init_database,
@@ -47,6 +48,7 @@ from global_database import (  # noqa: E402
     stats,
     steam_details_candidates,
     steam_review_candidates,
+    steam_review_selection_counts,
     save_steam_error,
     upsert_catalog,
 )
@@ -328,10 +330,15 @@ def _record_steam_error(db_path, service, appid, error, report, failure_threshol
     print(f"[steam-{service}] Error {appid}: {error}", flush=True)
     # Leave both cached data and successful fetch dates untouched. A per-row
     # delay prevents a permanently bad app from monopolising the next batch.
-    save_steam_error(db_path, appid, service, error, retry_delay(error))
     service_failure = is_service_failure(error)
+    transient_failure = is_transient_failure(error)
+    delay = retry_delay(error)
+    if service == "reviews" and not service_failure and not transient_failure:
+        delay = max(delay, GLOBAL_STEAM_REVIEWS_ERROR_COOLDOWN_SECONDS)
+        report["individual_errors"] += 1
+    save_steam_error(db_path, appid, service, error, delay)
     report["consecutive_failures"] = (report["consecutive_failures"] + 1
-                                      if is_transient_failure(error) else 0)
+                                      if transient_failure else 0)
     if service_failure or report["consecutive_failures"] >= failure_threshold:
         key = f"steam_{service}_retry_after"
         until = time.time() + retry_delay(error)
@@ -406,9 +413,12 @@ def _update_reviews(db_path, report, interval, deadline, details_done,
     # request spacing and unconditional rate-limit/Retry-After backoff.
     client = ReviewClient(interval=interval, circuit_on_invalid=False, circuit_on_transient=False)
     attempted_appids = set()
+    report.update(eligible=0, cooldown_excluded=0, min_age_excluded=0,
+                  individual_errors=0, unused_capacity=report["limit"])
     try:
         if report["limit"] <= 0:
             return
+        report.update(steam_review_selection_counts(db_path))
         while report["attempted"] < report["limit"]:
             # Read done BEFORE querying, so the last detail cannot be missed.
             complete = details_done.is_set()
@@ -448,7 +458,17 @@ def _update_reviews(db_path, report, interval, deadline, details_done,
                 if report["attempted"] % 100 == 0:
                     print(f"[steam-reviews] {report['attempted']}/{report['limit']} | {report['updated']} updated", flush=True)
     finally:
-        _finish_lane_report(report, started)
+        try:
+            if report["limit"] > 0:
+                remaining = steam_review_selection_counts(db_path, exclude_appids=attempted_appids)
+                # Initial/final snapshots account for concurrent Store arrivals
+                # without scanning the full catalogue on each idle poll.
+                report["eligible"] = max(report["eligible"], report["attempted"] + remaining["eligible"])
+                for key in ("cooldown_excluded", "min_age_excluded"):
+                    report[key] = max(report[key], remaining[key])
+        finally:
+            report["unused_capacity"] = max(0, report["limit"] - report["attempted"])
+            _finish_lane_report(report, started)
 
 
 def update_steam(db_path, *, limit, pause_seconds, reviews_limit=None,
