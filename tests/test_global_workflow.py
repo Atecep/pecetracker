@@ -208,10 +208,11 @@ class GlobalWorkflowTests(unittest.TestCase):
                 git.touch()
                 with patch.object(sys, 'platform', 'win32'), \
                      patch.object(shutil, 'which', side_effect=lambda name: str(git) if name == 'git' else str(wsl_bash)):
-                    self.assertEqual(workflow_bash(), str(git_bash))
+                    # resolve() can expand Windows 8.3 names from the temp path.
+                    self.assertTrue(git_bash.samefile(workflow_bash()))
         with patch.object(sys, 'platform', 'win32'), patch.object(shutil, 'which', return_value=None), \
              patch.dict(os.environ, {'ProgramFiles': str(self.root / 'Program Files')}, clear=True):
-            self.assertEqual(workflow_bash(), str(git_bash))
+            self.assertTrue(git_bash.samefile(workflow_bash()))
         with patch.object(sys, 'platform', 'win32'), patch.object(shutil, 'which', return_value=str(wsl_bash)), \
              patch.dict(os.environ, {}, clear=True), self.assertRaises(FileNotFoundError):
             workflow_bash()
