@@ -22,7 +22,7 @@ on:
 
   schedule:
     # Maintenance runs twice daily; anonymous reviews are paced separately.
-    - cron: "12 4,16 * * *"
+    - cron: "12 4,10,16,22 * * *"
 
 permissions:
   contents: write
