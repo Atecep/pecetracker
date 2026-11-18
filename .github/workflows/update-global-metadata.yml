@@ -88,9 +88,9 @@ jobs:
             echo "STEAM_REVIEWS_LIMIT=$INPUT_REVIEWS_LIMIT" >> "$GITHUB_ENV"
             echo "HLTB_LIMIT=$INPUT_HLTB_LIMIT" >> "$GITHUB_ENV"
           else
-            echo "STEAM_LIMIT=2500" >> "$GITHUB_ENV"
-            echo "STEAM_REVIEWS_LIMIT=2500" >> "$GITHUB_ENV"
-            echo "HLTB_LIMIT=1300" >> "$GITHUB_ENV"
+            echo "STEAM_LIMIT=5000" >> "$GITHUB_ENV"
+            echo "STEAM_REVIEWS_LIMIT=5000" >> "$GITHUB_ENV"
+            echo "HLTB_LIMIT=2600" >> "$GITHUB_ENV"
           fi
 
       - name: Update global metadata
